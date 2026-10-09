@@ -75,6 +75,60 @@ def load_squad(team_id, year, group):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def handed_splits(player_id, year, group):
+    """Observed MLB season split stats against L/R opponent hands.
+
+    Hitting: vl/vs LHP, vr/vs RHP.
+    Pitching: vl/vs LHB, vr/vs RHB.
+    Missing or unidentified records are left missing.
+    """
+    result = {}
+    for hand_code, situation in (("L", "vl"), ("R", "vr")):
+        try:
+            payload = fetch(
+                f"people/{player_id}/stats",
+                {"stats": "statSplits", "group": group,
+                 "season": year, "gameType": "R", "sitCodes": situation}
+            )
+            for section in payload.get("stats", []):
+                for entry in section.get("splits", []):
+                    values = entry.get("stat") or {}
+                    # A single-situation request can still contain
+                    # several records: accept only a matching situation
+                    # or an unambiguous single-record response.
+                    meta = entry.get("split") or {}
+                    code = str(entry.get("sitCode") or meta.get("code") or "").lower()
+                    description = str(meta.get("description") or "").lower()
+                    if code and code not in (situation,):
+                        continue
+                    if description:
+                        if hand_code == "L" and "right" in description:
+                            continue
+                        if hand_code == "R" and "left" in description:
+                            continue
+                    if number(values.get("atBats")) > 0:
+                        result[hand_code] = values
+                        break
+                if hand_code in result:
+                    break
+        except (requests.RequestException, ValueError, KeyError):
+            continue
+    return result
+
+
+def observed_batting_split(hitter, pitcher_hand, year):
+    if pitcher_hand not in ("L", "R"):
+        return None
+    return handed_splits(hitter["id"], year, "hitting").get(pitcher_hand)
+
+
+def observed_pitching_split(pitcher_obj, hitter_hand, year):
+    if hitter_hand not in ("L", "R"):
+        return None
+    return handed_splits(pitcher_obj["id"], year, "pitching").get(hitter_hand)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
 def h2h(pid, bid, year):
     try:
         data=fetch(f'people/{pid}/stats',{'stats':'vsPlayer','group':'pitching','season':year,'opposingPlayerId':bid,'gameType':'R'})
@@ -95,7 +149,7 @@ def starting_game(data, starter, mode):
       appearance=0,entry_inning=1,warming={},ready=[],inning=1,outs=0,runs=0,
       hits=0,walks=0,bases=[False]*3,spot=0,finished=False,mode=mode,
       log=['PLAY BALL!'],decisions=[],strategy_log=[],strikeouts=0,double_plays=0,
-      intentional_walks=0,last_play='Game begins!')
+      intentional_walks=0,last_play='Game begins!',play_result='',play_detail='',play_runs=0)
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -137,13 +191,40 @@ def batter_hit_rates(h):
 
 
 def estimate(g,p,h,approach='Balanced',defense='Normal'):
-    # Transparent educational model; NOT measured pitcher/batter matchup probabilities.
-    ps=p['stats']; bf=max(1,number(ps.get('battersFaced'),1)); avg,_=batter_hit_rates(h)
-    hand_adjust=-.017 if h['bats']==p['throws'] and h['bats'] in ('L','R') else .010
+    """Educational outcome model informed by actual available L/R splits."""
+    ps=p['stats']; bf=max(1,number(ps.get('battersFaced'),1))
+    avg,_=batter_hit_rates(h)
+    actual_h=observed_batting_split(h,p['throws'],g['year'])
+    split_ab=number(actual_h.get('atBats')) if actual_h else 0
+    if split_ab >= 1:
+        # Blend sample-size-sensitive observed split with season rate.
+        # Avoid equating 5 AB and 400 AB evidence.
+        observed_avg=number(actual_h.get('hits'))/split_ab
+        weight=split_ab/(split_ab+90)
+        avg=weight*observed_avg+(1-weight)*avg
+        hand_adjust=0
+    else:
+        hand_adjust=-.017 if h['bats']==p['throws'] and h['bats'] in ('L','R') else .010
+
     tired=max(0,fatigue(g,p)-.65)
+    pitching_split=observed_pitching_split(p,h['bats'],g['year'])
+    if pitching_split and number(pitching_split.get('battersFaced')) >= 1:
+        split_bf=max(1,number(pitching_split.get('battersFaced')))
+        split_k=number(pitching_split.get('strikeOuts'))/split_bf
+        split_bb=number(pitching_split.get('baseOnBalls'))/split_bf
+        season_k=number(ps.get('strikeOuts'))/bf
+        season_bb=number(ps.get('baseOnBalls'))/bf
+        w=split_bf/(split_bf+90)
+        k_rate=w*split_k+(1-w)*season_k
+        bb_rate=w*split_bb+(1-w)*season_bb
+        # Pitching splits modify strikeout and walk rates, not a
+        # fabricated per-batter head-to-head probability.
+    else:
+        k_rate=number(ps.get('strikeOuts'))/bf
+        bb_rate=number(ps.get('baseOnBalls'))/bf
     hp=bounded(avg+hand_adjust+(number(ps.get('whip'),1.3)-1.3)*.045+(number(ps.get('era'),4.2)-4.2)*.006+tired*.065,.08,.48)
-    wp=bounded(number(ps.get('baseOnBalls'))/bf+tired*.03,.025,.18)
-    kp=bounded(number(ps.get('strikeOuts'))/bf-tired*.03,.06,.40)
+    wp=bounded(bb_rate+tired*.03,.025,.18)
+    kp=bounded(k_rate-tired*.03,.06,.40)
     if approach=='Attack the zone': hp*=1.12;wp*=.70;kp*=1.20
     elif approach=='Pitch carefully': hp*=.88;wp*=1.70;kp*=.82
     if defense=='Infield in' and g['bases'][2] and g['outs']<2: hp*=1.13
@@ -238,6 +319,7 @@ def intentional_walk(g):
     g['faced'][p['id']]+=1;g['appearance']+=1;g['intentional_walks']+=1
     g['strategy_log'].append(dict(Inning=g['inning'],Batter=h['name'],Pitcher=p['name'],
       Approach='Intentional walk',Defense='—',**{'Hit %':'—','Walk %':100}))
+    g['play_result']='INTENTIONAL WALK';g['play_detail']=f"{h['name']} takes first base";g['play_runs']=scored
     g['last_play']=f"{p['name']} intentionally walks {h['name']}."+(' A run scores!' if scored else '')
     g['log'].append(g['last_play']);after_batter(g)
 
@@ -263,6 +345,8 @@ def simulate(g,approach,defense):
         else:g['outs']+=1;result='is retired on a ball in play'
     pitches=random.randint(4,9) if approach=='Pitch carefully' else random.randint(2,6) if approach=='Attack the zone' else random.randint(3,8)
     g['pitches'][p['id']]+=pitches;g['faced'][p['id']]+=1;g['appearance']+=1
+    g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT'}.get(result,'OUT')
+    g['play_detail']=f"{h['name']} vs. {p['name']}";g['play_runs']=runs
     g['last_play']=f"Inning {g['inning']}: {h['name']} {result} vs. {p['name']} ({pitches} pitches)."+(f' {runs} run(s) score!' if runs else '')
     g['log'].append(g['last_play']);after_batter(g)
 
@@ -282,7 +366,29 @@ def diamond(g):
         return f'<rect x="{x-9}" y="{y-9}" width="18" height="18" transform="rotate(45 {x} {y})" fill="{fill}" stroke="#174832" stroke-width="2"/>'
     a,b,c=g['bases']
     svg=f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 245" style="width:100%;height:240px"><rect width="400" height="245" rx="13" fill="#16563D"/><path d="M200 222 L63 112 L200 12 L337 112 Z" fill="#BA8C58" stroke="#F0DDB4" stroke-width="3"/><path d="M200 200 L91 112 L200 34 L309 112 Z" fill="#267950"/><path d="M200 222 L20 76 M200 222 L380 76" stroke="white" stroke-width="2"/>{base(302,112,a)}{base(200,29,b)}{base(98,112,c)}{base(200,216,False)}<circle cx="200" cy="124" r="12" fill="#D7B27A"/><rect x="193" y="122" width="14" height="4" fill="white"/><text x="12" y="18" fill="white" font-size="12">Yellow = occupied base</text></svg>'''
-    components.html(svg,height=247,scrolling=False)
+    headline=escape(g.get('play_result',''))
+    detail=escape(g.get('play_detail',''))
+    runs=g.get('play_runs',0)
+    scoring=f"<div class='scoring'>+{runs} RUN{'S' if runs != 1 else ''}</div>" if runs else ''
+    overlay=(f"<div class='result'><div class='headline'>{headline}</div>"
+             f"<div class='detail'>{detail}</div>{scoring}</div>") if headline else ''
+    html=f"""<html><head><style>
+        body {{margin:0;overflow:hidden;background:transparent;font-family:Arial,sans-serif}}
+        .field {{position:relative;width:100%;height:245px}}
+        svg {{width:100%;height:245px}}
+        .result {{position:absolute;left:50%;top:52%;transform:translate(-50%,-50%);
+                 width:88%;box-sizing:border-box;padding:13px 10px;text-align:center;
+                 background:rgba(5,21,34,.91);border:3px solid #FFB234;
+                 border-radius:14px;box-shadow:0 5px 22px rgba(0,0,0,.6);
+                 animation:appear .3s ease-out}}
+        .headline {{font-size:clamp(22px,4vw,44px);font-weight:900;color:#fff;
+                    letter-spacing:1.5px;text-shadow:0 2px 3px #000}}
+        .detail {{font-size:13px;color:#f7e2b9;margin-top:4px}}
+        .scoring {{font-size:18px;font-weight:900;color:#FFBC38;margin-top:6px}}
+        @keyframes appear {{from {{opacity:0;transform:translate(-50%,-55%) scale(.88)}}
+                            to {{opacity:1;transform:translate(-50%,-50%) scale(1)}}}}
+        </style></head><body><div class='field'>{svg}{overlay}</div></body></html>"""
+    components.html(html,height=250,scrolling=False)
 
 
 def report_grade(g):
@@ -389,9 +495,27 @@ if g:
                 st.write(f"Verified H2H: {record.get('hits','—')} H / {record['atBats']} AB • AVG {record.get('avg','—')}")
             else:st.caption('Verified player-vs-player statistics unavailable; not estimated.')
         st.write(f"Batter AVG: **{h['stats'].get('avg','—')}** • Pitcher ERA: **{p['stats'].get('era','—')}**")
+        if not g['finished']:
+            st.markdown('#### 📊 Actual season handedness splits')
+            for pitcher_hand in ('L','R'):
+                record=observed_batting_split(h,pitcher_hand,g['year'])
+                label='LHP' if pitcher_hand=='L' else 'RHP'
+                if record:
+                    ab=int(number(record.get('atBats')))
+                    hits=int(number(record.get('hits')))
+                    st.write(f"**{h['name']} vs. {label}:** {hits}/{ab} • AVG {hits/ab:.3f}")
+                else:
+                    st.caption(f"{h['name']} vs. {label}: verified split unavailable")
+            pitching_record=observed_pitching_split(p,h['bats'],g['year'])
+            if pitching_record:
+                bf=int(number(pitching_record.get('battersFaced')))
+                st.caption(f"{p['name']} vs. {h['bats']}-handed batters: {bf} batters faced (season split)")
+            else:
+                st.caption('Pitcher handedness split unavailable; model uses season stats.')
+            st.caption('The simulator blends observed splits with season totals, weighting larger samples more heavily.')
         if alert and g['mode']=='Rookie':st.info('Compare the relievers below, but remember: estimated probabilities are not guarantees.')
     st.markdown('### 📊 Bullpen Matchup Lab')
-    st.caption('Estimated outcome rates against the NEXT THREE hitters. These are an educational model using season stats and hand, NOT official historical matchup splits. Lower risk proxy is preferable; it is not an actual chance of allowing a run.')
+    st.caption('Estimated outcome rates against the NEXT THREE hitters. These are educational estimates informed by historical L/R season splits when available, NOT official probabilities. Lower risk proxy is preferable; it is not an actual chance of allowing a run.')
     comparison=compare_pitchers(g)
     table=pd.DataFrame(comparison).drop(columns=['ID'])
     st.dataframe(table,hide_index=True,use_container_width=True)
@@ -410,4 +534,4 @@ if g:
             st.download_button('Download manager decisions CSV',pd.DataFrame(g['decisions']).to_csv(index=False),'manager_decisions.csv','text/csv')
     if st.button('START NEW GAME'):
         st.session_state.game=None;st.session_state.loaded=None;st.rerun()
-st.caption('MLB Stats API season statistics; playing situations and matchup probabilities are simulated. Rosters are season-level approximations, not actual single-game lineups.')
+st.caption('MLB Stats API season statistics and available L/R splits; playing situations and outcome probabilities are simulated. Rosters are season-level approximations, not actual single-game lineups.')
