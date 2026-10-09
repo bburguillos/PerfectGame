@@ -1,345 +1,314 @@
 
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# ==========================================
-# APP CONFIGURATION
-# ==========================================
-
 st.set_page_config(
-    page_title="You're the Manager | Shutout Challenge",
+    page_title="You're the Manager",
     page_icon="⚾",
     layout="wide"
 )
 
-API = "https://statsapi.mlb.com/api/v1"
-
 st.markdown("""
 <style>
 .block-container {
-    max-width: 1800px;
-    padding-top: 0.5rem;
-    padding-bottom: 1rem;
+    max-width: 1750px;
+    padding-top: .5rem;
 }
-h1 {
-    color: #F47721;
-    font-size: 2rem !important;
+h1 {color: #ee7624;}
+div[data-testid='stMetric'] {
+    background: #183849;
+    padding: 9px;
+    border-radius: 9px;
 }
-h3 {
-    font-size: 1.15rem !important;
-}
-[data-testid="stMetric"] {
-    background: #193449;
-    border-radius: 10px;
-    padding: 10px;
-}
-[data-testid="stMetric"] label,
-[data-testid="stMetric"] [data-testid="stMetricValue"] {
+div[data-testid='stMetric'] * {
     color: white !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
+API = "https://statsapi.mlb.com/api/v1"
 
-# ==========================================
-# GENERAL HELPERS
-# ==========================================
 
-def num(value, default=0.0):
+# =====================================
+# HELPERS
+# =====================================
+
+def val(x, default=0):
     try:
-        return float(value)
-    except (ValueError, TypeError):
+        return float(x)
+    except (TypeError, ValueError):
         return default
 
 
-def clamp(value, low, high):
-    return max(low, min(high, value))
+def bound(x, low, high):
+    return max(low, min(high, x))
 
 
-def hand_label(code):
+def hand(x):
     return {
         "L": "LHP",
-        "R": "RHP",
-        "S": "Switch",
-    }.get(code, "Unknown")
+        "R": "RHP"
+    }.get(x, "?HP")
 
 
-def batting_hand(code):
-    return {
-        "L": "L",
-        "R": "R",
-        "S": "S",
-    }.get(code, "?")
+def fmt(x):
+    return "—" if x is None else str(x)
 
 
-def pct(value):
-    return f"{value * 100:.1f}%"
-
-
-# ==========================================
-# MLB DATA CONNECTION
-# ==========================================
+# =====================================
+# MLB DATA
+# =====================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def api_get(path, params=None):
-    response = requests.get(
+def api(path, params=None):
+    r = requests.get(
         f"{API}/{path}",
         params=params or {},
-        timeout=20
+        timeout=16
     )
-    response.raise_for_status()
-    return response.json()
+    r.raise_for_status()
+    return r.json()
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_teams(year):
-    data = api_get(
-        "teams",
-        {"sportId": 1, "season": year}
-    )
+def teams(year):
     return sorted(
-        data.get("teams", []),
-        key=lambda x: x["name"]
+        api(
+            "teams",
+            {"sportId": 1, "season": year}
+        ).get("teams", []),
+        key=lambda t: t["name"]
     )
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_roster(team_id, year):
-    data = api_get(
+def roster(team_id, year):
+    return api(
         f"teams/{team_id}/roster",
         {
             "rosterType": "fullSeason",
             "season": year
         }
-    )
-    return data.get("roster", [])
+    ).get("roster", [])
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def player_info(pid):
-    data = api_get(f"people/{pid}")
-    people = data.get("people", [])
-    return people[0] if people else {}
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def player_stats(pid, year, group):
-    data = api_get(
-        f"people/{pid}/stats",
+def details(pid, year, group):
+    data = api(
+        f"people/{pid}",
         {
-            "stats": "season",
-            "group": group,
-            "season": year,
-            "gameType": "R"
+            "hydrate": (
+                f"stats(group=[{group}],"
+                f"type=[season],season={year})"
+            )
         }
     )
 
-    for section in data.get("stats", []):
+    p = (data.get("people") or [{}])[0]
+    stat = {}
+
+    for section in p.get("stats", []):
         for split in section.get("splits", []):
             if split.get("stat"):
-                return split["stat"]
+                stat = split["stat"]
+                break
 
-    return {}
+    if not stat:
+        d = api(
+            f"people/{pid}/stats",
+            {
+                "stats": "season",
+                "group": group,
+                "season": year,
+                "gameType": "R"
+            }
+        )
+
+        for section in d.get("stats", []):
+            for split in section.get("splits", []):
+                if split.get("stat"):
+                    stat = split["stat"]
+                    break
+
+    return {
+        "id": pid,
+        "name": p.get("fullName", "Unknown"),
+        "throws": p.get(
+            "pitchHand", {}
+        ).get("code", "?"),
+        "bats": p.get(
+            "batSide", {}
+        ).get("code", "?"),
+        "stats": stat,
+        "position": p.get(
+            "primaryPosition", {}
+        ).get("abbreviation", "")
+    }
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_team(team_id, year, kind):
-    entries = get_roster(team_id, year)
+def squad(team_id, year, group):
+    entries = roster(team_id, year)
+    ids = []
 
-    if kind == "pitchers":
-        group = "pitching"
-        entries = [
-            item for item in entries
-            if item.get("position", {}).get(
-                "abbreviation"
-            ) in ("P", "TWP")
-        ]
-    else:
-        group = "hitting"
-        entries = [
-            item for item in entries
-            if item.get("position", {}).get(
-                "abbreviation"
-            ) not in ("P", "TWP")
-        ]
+    for e in entries:
+        pos = e.get(
+            "position", {}
+        ).get("abbreviation")
+
+        if (group == "pitching") == (
+            pos in ("P", "TWP")
+        ):
+            pid = e.get("person", {}).get("id")
+            if pid:
+                ids.append(pid)
 
     players = []
 
-    for item in entries:
-        person = item.get("person", {})
-        pid = person.get("id")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(
+                details, pid, year, group
+            ): pid
+            for pid in ids
+        }
 
-        if not pid:
-            continue
+        for future in as_completed(futures):
+            try:
+                p = future.result()
+                s = p["stats"]
 
-        try:
-            stats = player_stats(pid, year, group)
+                if (
+                    group == "pitching"
+                    and val(s.get("gamesPlayed")) > 0
+                ):
+                    gs = val(s.get("gamesStarted"))
+                    gp = val(s.get("gamesPlayed"))
 
-            if not stats:
-                continue
+                    p["role"] = (
+                        "SP"
+                        if gs >= max(3, gp * .35)
+                        else "RP"
+                    )
 
-            if kind == "pitchers":
-                if num(stats.get("inningsPitched")) < 1:
-                    continue
-            else:
-                if num(stats.get("atBats")) < 1:
-                    continue
+                    p["relief_apps"] = max(
+                        0, gp - gs
+                    )
 
-            info = player_info(pid)
+                    players.append(p)
 
-            player = {
-                "id": pid,
-                "name": person.get(
-                    "fullName", "Unknown"
-                ),
-                "stats": stats,
-                "position": item.get(
-                    "position", {}
-                ).get("abbreviation", ""),
-                "throws": info.get(
-                    "pitchHand", {}
-                ).get("code", "?"),
-                "bats": info.get(
-                    "batSide", {}
-                ).get("code", "?")
-            }
+                elif (
+                    group == "hitting"
+                    and val(s.get("atBats")) > 0
+                ):
+                    players.append(p)
 
-            if kind == "pitchers":
-                starts = num(
-                    stats.get("gamesStarted")
-                )
-                games = max(
-                    1, num(stats.get("gamesPlayed"))
-                )
+            except (
+                requests.RequestException,
+                ValueError
+            ):
+                pass
 
-                player["role"] = (
-                    "SP"
-                    if starts >= max(3, games * 0.35)
-                    else "RP"
-                )
-
-                player["relief_apps"] = max(
-                    0, games - starts
-                )
-
-            players.append(player)
-
-        except requests.RequestException:
-            continue
-
-    if kind == "pitchers":
+    if group == "pitching":
         starters = sorted(
-            [
+            (
                 p for p in players
                 if p["role"] == "SP"
-            ],
-            key=lambda p: -num(
+            ),
+            key=lambda p: -val(
                 p["stats"].get("gamesStarted")
             )
         )[:5]
 
-        bullpen = sorted(
-            [
+        relief = sorted(
+            (
                 p for p in players
                 if p["role"] == "RP"
-            ],
+            ),
             key=lambda p: -p["relief_apps"]
         )[:8]
 
-        return starters + bullpen
+        return starters + relief
 
     return sorted(
         players,
-        key=lambda p: -num(
+        key=lambda p: -val(
             p["stats"].get(
                 "plateAppearances",
-                p["stats"].get("atBats")
+                val(p["stats"].get("atBats"))
             )
         )
     )[:13]
 
 
-# ==========================================
-# PITCHER VS BATTER HISTORY
-# ==========================================
+# =====================================
+# HEAD TO HEAD
+# =====================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def head_to_head(pitcher_id, batter_id, year):
+def matchup(pid, bid, year):
     try:
-        data = api_get(
-            f"people/{pitcher_id}/stats",
+        data = api(
+            f"people/{pid}/stats",
             {
                 "stats": "vsPlayer",
                 "group": "pitching",
                 "season": year,
-                "opposingPlayerId": batter_id,
+                "opposingPlayerId": bid,
                 "gameType": "R"
             }
         )
 
         for section in data.get("stats", []):
             for split in section.get("splits", []):
-                opponent = split.get(
-                    "opponent", {}
-                )
-                player = split.get("player", {})
-
-                opponent_id = opponent.get(
-                    "id",
-                    player.get("id")
+                opponent = (
+                    split.get("opponent", {})
+                    or split.get("player", {})
                 )
 
-                if str(opponent_id) != str(batter_id):
-                    continue
-
-                stats = split.get("stat", {})
-
-                if not stats:
-                    continue
-
-                return stats
+                if (
+                    str(opponent.get("id")) == str(bid)
+                    and split.get("stat")
+                ):
+                    return split["stat"]
 
     except (
         requests.RequestException,
-        ValueError,
-        KeyError
+        ValueError
     ):
         pass
 
     return None
 
 
-# ==========================================
-# GAME INITIALIZATION
-# ==========================================
+# =====================================
+# GAME STATE
+# =====================================
 
-def create_game(
-    year, team, opponent,
-    staff, hitters, starter_id
-):
+def new_game(package, starter, mode):
+    staff = package["staff"]
+    lineup = package["hitters"][:9]
+
     return {
-        "year": year,
-        "team": team,
-        "opponent": opponent,
+        "year": package["year"],
+        "team": package["team"],
+        "opponent": package["opponent"],
         "staff": staff,
-        "lineup": [
-            p.copy() for p in hitters[:9]
-        ],
-        "bench": [
-            p.copy() for p in hitters[9:]
-        ],
-        "pitcher": starter_id,
-        "used": [starter_id],
+        "lineup": lineup.copy(),
+        "bench": package["hitters"][9:].copy(),
+        "pitcher": starter,
+        "used": [starter],
         "pitches": {
             p["id"]: 0 for p in staff
         },
-        "batters_faced": {
+        "faced": {
             p["id"]: 0 for p in staff
         },
-        "appearance_batters": 0,
+        "appearance": 0,
         "entry_inning": 1,
         "warming": {},
         "ready": [],
@@ -348,577 +317,666 @@ def create_game(
         "runs": 0,
         "hits": 0,
         "walks": 0,
-        "bases": [False, False, False],
+        "bases": [False] * 3,
         "spot": 0,
         "finished": False,
+        "mode": mode,
         "log": [
-            "PLAY BALL! The shutout challenge begins."
+            "PLAY BALL! Defend the shutout."
         ],
-        "decisions": []
+        "decisions": [],
+        "strikeouts": 0,
+        "double_plays": 0,
+        "score": 100,
+        "last_play": "Game begins!"
     }
 
 
-def current_pitcher(game):
+def pitcher(g):
     return next(
-        p for p in game["staff"]
-        if p["id"] == game["pitcher"]
+        p for p in g["staff"]
+        if p["id"] == g["pitcher"]
     )
 
 
-def current_batter(game):
-    return game["lineup"][game["spot"] % 9]
+def batter(g):
+    return g["lineup"][g["spot"] % 9]
 
 
-# ==========================================
-# PITCHER FATIGUE
-# ==========================================
+# =====================================
+# STAMINA
+# =====================================
 
-def fatigue(game):
-    pitcher = current_pitcher(game)
+def stamina(g):
+    p = pitcher(g)
+    s = p["stats"]
 
-    # Forgiving educational stamina model.
-    # Approximately half the buildup of version 1.
-    limit = (
-        190 if pitcher["role"] == "SP"
-        else 46
+    gs = val(s.get("gamesStarted"))
+    ip = val(s.get("inningsPitched"))
+
+    average_ip = (
+        ip / max(1, gs)
+        if gs else 0
     )
 
+    if p["role"] == "SP":
+        limit = bound(
+            average_ip * 18
+            if average_ip else 105,
+            85,
+            140
+        )
+    else:
+        relief_games = max(
+            1,
+            val(s.get("gamesPlayed")) - gs
+        )
+
+        limit = bound(
+            ip / relief_games * 23,
+            20,
+            48
+        )
+
+    if g["mode"] == "Rookie":
+        limit *= 1.35
+
+    elif g["mode"] == "Hall of Fame":
+        limit *= .90
+
+    return g["pitches"][p["id"]] / limit
+
+
+def change_legal(g):
     return (
-        game["pitches"][pitcher["id"]]
-        / limit
+        not g["finished"]
+        and (
+            g["appearance"] >= 3
+            or g["inning"] > g["entry_inning"]
+        )
     )
 
 
-def can_change(game):
-    if game["finished"]:
-        return False
+# =====================================
+# BULLPEN
+# =====================================
 
-    return (
-        game["appearance_batters"] >= 3
-        or game["inning"] > game["entry_inning"]
-    )
-
-
-# ==========================================
-# INTERACTIVE BULLPEN
-# ==========================================
-
-def warm_up(game, pid):
+def warm(g, pid):
     if (
-        pid in game["used"]
-        or pid in game["ready"]
-        or pid in game["warming"]
+        pid in g["used"]
+        or pid in g["ready"]
+        or pid in g["warming"]
     ):
-        return False
+        return
 
-    game["warming"][pid] = 0
+    g["warming"][pid] = 0
 
-    pitcher = next(
-        p for p in game["staff"]
+    p = next(
+        p for p in g["staff"]
         if p["id"] == pid
     )
 
-    game["log"].append(
-        f"🔥 {pitcher['name']} "
-        f"({hand_label(pitcher['throws'])}) "
-        "begins warming."
+    g["log"].append(
+        f"🔥 {p['name']} "
+        f"({hand(p['throws'])}) begins warming."
     )
 
-    return True
 
+def warm_tick(g):
+    for pid in list(g["warming"]):
+        g["warming"][pid] += 1
 
-def advance_warmups(game):
-    for pid in list(game["warming"]):
-        game["warming"][pid] += 1
+        if g["warming"][pid] >= 2:
+            del g["warming"][pid]
+            g["ready"].append(pid)
 
-        if game["warming"][pid] >= 2:
-            game["ready"].append(pid)
-            del game["warming"][pid]
-
-            pitcher = next(
-                p for p in game["staff"]
+            p = next(
+                p for p in g["staff"]
                 if p["id"] == pid
             )
 
-            game["log"].append(
-                f"✅ {pitcher['name']} is READY!"
+            g["log"].append(
+                f"✅ {p['name']} is ready."
             )
 
 
-def change_pitcher(game, pid, reason):
-    if not can_change(game):
-        return False
-
+def bring_in(g, pid, reason):
     if (
-        pid not in game["ready"]
-        or pid in game["used"]
+        not change_legal(g)
+        or pid not in g["ready"]
     ):
-        return False
+        return
 
-    old = current_pitcher(game)
-
+    old = pitcher(g)
     new = next(
-        p for p in game["staff"]
+        p for p in g["staff"]
         if p["id"] == pid
     )
 
-    game["pitcher"] = pid
-    game["used"].append(pid)
-    game["ready"].remove(pid)
+    prior_fatigue = stamina(g)
 
-    game["appearance_batters"] = 0
-    game["entry_inning"] = game["inning"]
+    if prior_fatigue > 1.1:
+        g["score"] -= 8
 
-    game["decisions"].append({
-        "Inning": game["inning"],
-        "Outs": game["outs"],
-        "Removed": old["name"],
-        "Entered": new["name"],
-        "Hand": hand_label(new["throws"]),
+    if prior_fatigue > .75:
+        g["score"] += 3
+
+    if old["throws"] != new["throws"]:
+        g["score"] += 2
+
+    g["pitcher"] = pid
+    g["used"].append(pid)
+    g["ready"].remove(pid)
+
+    g["appearance"] = 0
+    g["entry_inning"] = g["inning"]
+
+    g["decisions"].append({
+        "Inning": g["inning"],
+        "Outs": g["outs"],
+        "Pitcher Out": old["name"],
+        "Pitcher In": new["name"],
+        "Throws": hand(new["throws"]),
         "Reason": reason
     })
 
-    game["log"].append(
-        f"🔁 PITCHING CHANGE: "
-        f"{new['name']} "
-        f"({hand_label(new['throws'])}) "
-        f"replaces {old['name']}."
+    g["log"].append(
+        f"🔁 {new['name']} replaces "
+        f"{old['name']} ({reason})."
     )
 
-    return True
 
+# =====================================
+# COMPUTER MANAGER
+# =====================================
 
-# ==========================================
-# COMPUTER PINCH HITTING
-# ==========================================
-
-def computer_pinch_hit(game):
-    if game["inning"] < 7:
+def pinch_hit(g):
+    if g["inning"] < 7 or not g["bench"]:
         return
 
-    if not game["bench"]:
-        return
+    ix = g["spot"] % 9
+    old = g["lineup"][ix]
+    p = pitcher(g)
 
-    index = game["spot"] % 9
-    batter = game["lineup"][index]
-    pitcher = current_pitcher(game)
-
-    candidates = sorted(
-        game["bench"],
-        key=lambda p: num(
-            p["stats"].get("avg")
-        ),
-        reverse=True
-    )
-
-    replacement = candidates[0]
-
-    old_avg = num(
-        batter["stats"].get("avg")
-    )
-    new_avg = num(
-        replacement["stats"].get("avg")
-    )
-
-    same_hand = (
-        batter["bats"] in ("L", "R")
-        and batter["bats"] == pitcher["throws"]
-    )
-
-    if (
-        (old_avg < .235 and new_avg > old_avg + .035)
-        or
-        (same_hand and new_avg > old_avg + .065)
+    if not (
+        sum(g["bases"])
+        or g["inning"] >= 8
     ):
-        game["lineup"][index] = replacement
-        game["bench"].remove(replacement)
+        return
 
-        game["log"].append(
-            f"📣 PINCH HITTER! "
+    def matchup_score(h):
+        avg = val(
+            h["stats"].get("avg"), .240
+        )
+
+        hhand = h["bats"]
+
+        penalty = (
+            .02
+            if hhand == p["throws"]
+            and hhand in ("L", "R")
+            else 0
+        )
+
+        return avg - penalty
+
+    replacement = max(
+        g["bench"],
+        key=matchup_score
+    )
+
+    if matchup_score(replacement) > (
+        matchup_score(old) + .035
+    ):
+        g["lineup"][ix] = replacement
+        g["bench"].remove(replacement)
+
+        g["log"].append(
+            f"📣 PINCH HITTER: "
             f"{replacement['name']} replaces "
-            f"{batter['name']}."
+            f"{old['name']}!"
         )
 
 
-# ==========================================
-# BASE RUNNER LOGIC
-# ==========================================
+# =====================================
+# BASERUNNING
+# =====================================
 
-def advance_hit(game, distance):
-    new_bases = [False, False, False]
+def hit_bases(g, distance):
+    old = g["bases"]
+    new = [False] * 3
     runs = 0
 
-    for index in (2, 1, 0):
-        if game["bases"][index]:
-            destination = index + distance
+    if distance == 4:
+        runs = 1 + sum(old)
+
+    else:
+        for i in (2, 1, 0):
+            if not old[i]:
+                continue
+
+            advance = distance
+
+            if (
+                distance == 1
+                and i == 1
+                and random.random() < (
+                    .72 if g["outs"] == 2
+                    else .50
+                )
+            ):
+                advance = 2
+
+            if (
+                distance == 1
+                and i == 0
+                and random.random() < .23
+            ):
+                advance = 2
+
+            destination = i + advance
 
             if destination >= 3:
                 runs += 1
+
+            elif new[destination]:
+                free = next(
+                    (
+                        j for j in range(
+                            destination + 1, 3
+                        )
+                        if not new[j]
+                    ),
+                    None
+                )
+
+                if free is None:
+                    runs += 1
+                else:
+                    new[free] = True
+
             else:
-                new_bases[destination] = True
+                new[destination] = True
 
-    if distance == 4:
-        runs += 1
-    else:
-        new_bases[distance - 1] = True
+        new[distance - 1] = True
 
-    game["bases"] = new_bases
-    game["runs"] += runs
+    g["bases"] = new
+    g["runs"] += runs
 
     return runs
 
 
-def advance_walk(game):
-    first, second, third = game["bases"]
+def walk_bases(g):
+    a, b, c = g["bases"]
 
-    runs = int(first and second and third)
+    score = int(a and b and c)
 
-    game["bases"] = [
+    g["bases"] = [
         True,
-        first or second,
-        third or (first and second)
+        a or b,
+        c or (a and b)
     ]
 
-    game["walks"] += 1
-    game["runs"] += runs
+    g["walks"] += 1
+    g["runs"] += score
 
-    return runs
+    return score
 
 
-# ==========================================
-# SIMULATE AN AT-BAT
-# ==========================================
+# =====================================
+# SIMULATION ENGINE
+# =====================================
 
-def simulate_at_bat(game):
-    if game["finished"]:
+def simulate(g):
+    if g["finished"]:
         return
 
-    computer_pinch_hit(game)
+    pinch_hit(g)
 
-    pitcher = current_pitcher(game)
-    batter = current_batter(game)
+    p = pitcher(g)
+    h = batter(g)
 
-    ps = pitcher["stats"]
-    hs = batter["stats"]
+    ps = p["stats"]
+    hs = h["stats"]
 
-    avg = num(hs.get("avg"), .250)
-    obp = num(hs.get("obp"), .320)
-    slg = num(hs.get("slg"), .400)
+    ab = max(
+        1,
+        val(hs.get("atBats"), 1)
+    )
+
+    hits = val(hs.get("hits"))
+
+    avg = bound(
+        hits / ab
+        if hits
+        else val(hs.get("avg"), .250),
+        .08,
+        .45
+    )
+
+    doubles = val(hs.get("doubles"))
+    triples = val(hs.get("triples"))
+    homers = val(hs.get("homeRuns"))
+
+    singles = max(
+        0,
+        hits - doubles - triples - homers
+    )
+
+    if (
+        singles + doubles + triples + homers
+    ) <= 0:
+        singles, doubles, triples, homers = (
+            70, 19, 2, 9
+        )
 
     bf = max(
-        1, num(ps.get("battersFaced"), 300)
+        1,
+        val(ps.get("battersFaced"), 1)
     )
 
-    k_rate = (
-        num(ps.get("strikeOuts")) / bf
+    k_rate = bound(
+        val(ps.get("strikeOuts")) / bf,
+        .06,
+        .38
     )
 
-    bb_rate = (
-        num(ps.get("baseOnBalls")) / bf
+    bb_rate = bound(
+        val(ps.get("baseOnBalls")) / bf,
+        .025,
+        .17
     )
 
-    tired = max(
-        0, fatigue(game) - .75
+    fatigued = max(
+        0,
+        stamina(g) - .65
     )
 
-    same_hand = (
-        batter["bats"] in ("L", "R")
-        and batter["bats"] == pitcher["throws"]
+    same = (
+        h["bats"] == p["throws"]
+        and h["bats"] in ("L", "R")
     )
 
     hand_adjust = (
-        -.015 if same_hand else .008
+        -.017 if same else .010
     )
 
-    # Educational simulation, not an official
-    # MLB predictive probability model.
-    hit_prob = clamp(
+    whip_adjust = (
+        val(ps.get("whip"), 1.3) - 1.3
+    ) * .045
+
+    era_adjust = (
+        val(ps.get("era"), 4.2) - 4.2
+    ) * .006
+
+    hit_prob = bound(
         avg
-        + (num(ps.get("whip"), 1.3) - 1.3) * .055
-        + (num(ps.get("era"), 4.2) - 4.2) * .008
         + hand_adjust
-        + tired * .065,
-        .075,
+        + whip_adjust
+        + era_adjust
+        + fatigued * .065,
+        .08,
         .48
     )
 
-    walk_prob = clamp(
-        .82 * bb_rate
-        + .12 * max(0, obp - avg)
-        + tired * .025,
+    walk_prob = bound(
+        bb_rate + fatigued * .03,
         .025,
-        .16
+        .18
     )
 
-    strike_prob = clamp(
-        k_rate - tired * .035,
-        .08,
+    strike_prob = bound(
+        k_rate - fatigued * .03,
+        .06,
         .40
     )
 
-    pitches = random.randint(3, 8)
+    out_prob = max(
+        .05,
+        1 - hit_prob - walk_prob
+    )
 
-    game["pitches"][pitcher["id"]] += pitches
-    game["batters_faced"][pitcher["id"]] += 1
-    game["appearance_batters"] += 1
+    strike_prob = min(
+        strike_prob,
+        out_prob
+    )
 
     roll = random.random()
-    scored = 0
+
+    scores = 0
+    result = ""
 
     if roll < walk_prob:
-        scored = advance_walk(game)
+        scores = walk_bases(g)
         result = "walks"
 
     elif roll < walk_prob + hit_prob:
-        power = clamp(
-            slg - avg, .06, .38
-        )
+        distance = random.choices(
+            [1, 2, 3, 4],
+            weights=[
+                singles,
+                doubles,
+                triples,
+                homers
+            ],
+            k=1
+        )[0]
 
-        hit_roll = random.random()
-
-        if hit_roll < power * .24:
-            distance = 4
-        elif hit_roll < power * .27:
-            distance = 3
-        elif hit_roll < power * .69:
-            distance = 2
-        else:
-            distance = 1
-
-        scored = advance_hit(game, distance)
-        game["hits"] += 1
+        scores = hit_bases(g, distance)
+        g["hits"] += 1
 
         result = {
             1: "singles",
             2: "doubles",
-            3: "triples",
+            3: "TRIPLES",
             4: "HOMERS"
         }[distance]
 
+    elif roll < (
+        walk_prob + hit_prob + strike_prob
+    ):
+        g["outs"] += 1
+        g["strikeouts"] += 1
+        result = "strikes out"
+
     else:
-        game["outs"] += 1
+        first = g["bases"][0]
+        third = g["bases"][2]
 
-        if roll < (
-            walk_prob + hit_prob + strike_prob
+        if (
+            first
+            and g["outs"] < 2
+            and random.random() < .13
         ):
-            result = "strikes out"
-        else:
-            result = "is retired on a ball in play"
+            g["outs"] += 2
+            g["double_plays"] += 1
+            g["bases"][0] = False
 
-    message = (
-        f"Inning {game['inning']}: "
-        f"{batter['name']} {result} "
-        f"against {pitcher['name']}."
+            result = (
+                "grounds into a DOUBLE PLAY"
+            )
+
+        elif (
+            third
+            and g["outs"] < 2
+            and random.random() < .17
+        ):
+            g["outs"] += 1
+            g["bases"][2] = False
+            g["runs"] += 1
+
+            scores = 1
+            result = "hits a sacrifice fly"
+
+        else:
+            g["outs"] += 1
+            result = (
+                "is retired on a ball in play"
+            )
+
+    count = random.randint(3, 8)
+
+    g["pitches"][p["id"]] += count
+    g["faced"][p["id"]] += 1
+    g["appearance"] += 1
+
+    note = (
+        f"Inning {g['inning']}: "
+        f"{h['name']} {result} "
+        f"vs. {p['name']} "
+        f"({count} pitches)."
     )
 
-    if scored:
-        message += f" {scored} run(s) score!"
+    if scores:
+        note += (
+            f" {scores} run(s) score!"
+        )
+        g["score"] -= scores * 12
 
-    game["log"].append(message)
+    g["last_play"] = note
+    g["log"].append(note)
 
-    game["spot"] += 1
+    g["spot"] += 1
+    warm_tick(g)
 
-    advance_warmups(game)
-
-    if game["outs"] >= 3:
-        game["log"].append(
-            f"End of inning {game['inning']}."
+    if g["outs"] >= 3:
+        g["log"].append(
+            f"End of inning {g['inning']} — "
+            f"{g['runs']} runs allowed."
         )
 
-        game["inning"] += 1
-        game["outs"] = 0
-        game["bases"] = [False, False, False]
+        g["outs"] = 0
+        g["bases"] = [False] * 3
+        g["inning"] += 1
 
-    if game["inning"] > 9:
-        game["finished"] = True
+    if g["inning"] > 9:
+        g["finished"] = True
 
-        if game["runs"] == 0:
-            game["log"].append(
-                "🏆 SHUTOUT COMPLETE!"
-            )
-        else:
-            game["log"].append(
-                f"FINAL: {game['runs']} runs allowed."
-            )
+        g["log"].append(
+            "🏆 SHUTOUT!"
+            if g["runs"] == 0
+            else "Game complete."
+        )
 
 
-# ==========================================
+# =====================================
 # DANGER DETECTION
-# ==========================================
+# =====================================
 
-def danger_status(game):
-    first, second, third = game["bases"]
-    runners = sum(game["bases"])
+def danger(g):
+    if g["finished"]:
+        return None
 
-    if game["finished"]:
-        return False, "Game complete"
+    if all(g["bases"]):
+        return "🚨 BASES LOADED"
 
-    if runners == 3:
-        return True, "🚨 BASES LOADED!"
-
-    if second or third:
-        return True, "⚠️ RUNNER IN SCORING POSITION!"
-
-    if game["outs"] == 2 and runners:
-        return True, "⚠️ TWO-OUT JAM!"
-
-    if game["inning"] >= 7 and runners:
-        return True, "🔥 LATE-INNING PRESSURE!"
-
-    if fatigue(game) >= .85:
-        return True, "🔋 FATIGUE DANGER!"
-
-    return False, "No immediate danger"
-
-
-# ==========================================
-# LIVE BASEBALL DIAMOND
-# ==========================================
-
-def draw_field(game):
-
-    first, second, third = game["bases"]
-
-    def base(x, y, occupied):
-        color = (
-            "#FFBA32" if occupied
-            else "#FFFFFF"
+    if (
+        g["bases"][1]
+        or g["bases"][2]
+    ):
+        return (
+            "⚠️ RUNNER IN SCORING POSITION"
         )
 
-        return f"""
-        <rect x="{x}" y="{y}"
-              width="18" height="18"
-              transform="rotate(45 {x+9} {y+9})"
-              fill="{color}"
-              stroke="#143A2B"
-              stroke-width="2"/>
-        """
+    if (
+        g["inning"] >= 7
+        and any(g["bases"])
+    ):
+        return "🔥 LATE-INNING PRESSURE"
+
+    if stamina(g) > .9:
+        return "🔋 FATIGUE WARNING"
+
+    return None
+
+
+# =====================================
+# LIVE DIAMOND
+# =====================================
+
+def diamond(g):
+    def base(x, y, on):
+        color = (
+            "#FFB93A" if on else "white"
+        )
+
+        return (
+            f'<rect x="{x-9}" y="{y-9}" '
+            f'width="18" height="18" '
+            f'transform="rotate(45 {x} {y})" '
+            f'fill="{color}" '
+            f'stroke="#174832" '
+            f'stroke-width="2"/>'
+        )
+
+    a, b, c = g["bases"]
 
     svg = f"""
     <html>
-    <body style="
-        margin:0;
-        padding:0;
-        overflow:hidden;
-        background:transparent;
-    ">
+    <body style="margin:0;background:transparent">
+    <svg xmlns="http://www.w3.org/2000/svg"
+         viewBox="0 0 400 245"
+         style="width:100%;height:240px">
 
-    <svg viewBox="0 0 400 250"
-         xmlns="http://www.w3.org/2000/svg"
-         style="
-            width:100%;
-            height:250px;
-            display:block;
-         ">
+      <rect width="400" height="245"
+            rx="13" fill="#16563D"/>
 
-      <!-- Outfield -->
-
-      <rect width="400" height="250"
-            rx="14" fill="#164D38"/>
-
-      <!-- Grass stripes -->
-
-      <path d="M0 35 H400"
-            stroke="#236B4D"
-            stroke-width="30"/>
-
-      <path d="M0 115 H400"
-            stroke="#236B4D"
-            stroke-width="30"/>
-
-      <path d="M0 195 H400"
-            stroke="#236B4D"
-            stroke-width="30"/>
-
-      <!-- Infield dirt -->
-
-      <path d="M200 228 L65 112
-               L200 12 L335 112 Z"
-            fill="#BE8B58"
-            stroke="#F2D6AA"
+      <path d="M200 222 L63 112
+               L200 12 L337 112 Z"
+            fill="#BA8C58"
+            stroke="#F0DDB4"
             stroke-width="3"/>
 
-      <!-- Infield grass -->
+      <path d="M200 200 L91 112
+               L200 34 L309 112 Z"
+            fill="#267950"/>
 
-      <path d="M200 206 L91 112
-               L200 33 L309 112 Z"
-            fill="#267A50"/>
-
-      <!-- Foul lines -->
-
-      <line x1="200" y1="228"
-            x2="23" y2="78"
+      <path d="M200 222 L20 76
+               M200 222 L380 76"
             stroke="white"
             stroke-width="2"/>
 
-      <line x1="200" y1="228"
-            x2="377" y2="78"
-            stroke="white"
-            stroke-width="2"/>
+      {base(302,112,a)}
+      {base(200,29,b)}
+      {base(98,112,c)}
+      {base(200,216,False)}
 
-      <!-- Bases -->
+      <circle cx="200" cy="124"
+              r="12" fill="#D7B27A"/>
 
-      {base(300, 103, first)}
-      {base(191, 22, second)}
-      {base(82, 103, third)}
-      {base(191, 213, False)}
-
-      <!-- Pitching mound -->
-
-      <circle cx="200" cy="122"
-              r="13" fill="#D5AE78"
-              stroke="#B8854F"
-              stroke-width="2"/>
-
-      <rect x="193" y="120"
+      <rect x="193" y="122"
             width="14" height="4"
-            rx="1" fill="white"/>
+            fill="white"/>
 
-      <!-- Occupied bases legend -->
-
-      <rect x="14" y="12"
-            width="11" height="11"
-            fill="#FFBA32"/>
-
-      <text x="31" y="22"
-            font-size="12"
+      <text x="12" y="19"
+            font-size="11"
             fill="white">
-        Runner on base
-      </text>
-
-      <text x="200" y="245"
-            text-anchor="middle"
-            font-size="12"
-            font-weight="bold"
-            fill="white">
-        HOME PLATE
+        Occupied bases shown in yellow
       </text>
 
     </svg>
-
     </body>
     </html>
     """
 
-    # IMPORTANT:
-    # Use Streamlit's HTML component.
-    # st.markdown does not reliably render SVG.
     components.html(
         svg,
-        height=255,
+        height=247,
         scrolling=False
     )
 
 
-# ==========================================
-# HEADER
-# ==========================================
+# =====================================
+# APP HEADER
+# =====================================
 
-st.title("⚾ YOU'RE THE MANAGER")
+st.title(
+    "⚾ YOU'RE THE MANAGER: SHUTOUT CHALLENGE"
+)
 
 st.caption(
-    "SPORTS BY THE NUMBERS | "
-    "MLB SHUTOUT CHALLENGE | 2000–2025"
+    "SPORTS BY THE NUMBERS • 2000–2025 MLB • "
+    "Real historical statistics / simulated outcomes"
 )
 
 if "game" not in st.session_state:
@@ -928,117 +986,120 @@ if "loaded" not in st.session_state:
     st.session_state.loaded = None
 
 
-# ==========================================
-# GAME SETUP
-# ==========================================
+# =====================================
+# TEAM SELECTION
+# =====================================
 
 with st.expander(
-    "⚙️ Historical Game Setup",
+    "⚙️ Select season and teams",
     expanded=st.session_state.game is None
 ):
 
     year = st.selectbox(
-        "Historical Season",
+        "Season",
         list(range(2025, 1999, -1))
     )
 
     try:
-        teams = get_teams(year)
+        teamlist = teams(year)
 
         names = {
             t["name"]: t["id"]
-            for t in teams
+            for t in teamlist
         }
 
-        col1, col2 = st.columns(2)
+        c1, c2 = st.columns(2)
 
-        with col1:
-            team_name = st.selectbox(
-                "Your MLB Team",
-                list(names)
-            )
+        own = c1.selectbox(
+            "Your pitching team",
+            list(names)
+        )
 
-        with col2:
-            opponent_name = st.selectbox(
-                "Opposing Team",
-                [
-                    name for name in names
-                    if name != team_name
-                ]
-            )
+        opp = c2.selectbox(
+            "Opposing batting team",
+            [
+                x for x in names
+                if x != own
+            ]
+        )
 
         if st.button(
-            "LOAD HISTORICAL ROSTERS",
+            "LOAD MLB ROSTERS",
             type="primary"
         ):
 
             with st.status(
                 "Preparing historical matchup...",
                 expanded=True
-            ) as loading:
+            ) as box:
 
-                progress = st.progress(0)
-
-                st.write(
-                    "⚾ Loading starters and bullpen..."
-                )
-
-                staff = load_team(
-                    names[team_name],
-                    year,
-                    "pitchers"
-                )
-
-                progress.progress(50)
+                bar = st.progress(0)
 
                 st.write(
-                    "🏏 Preparing opposing batting order..."
+                    "⚾ Loading starting pitchers "
+                    "and bullpen..."
                 )
 
-                hitters = load_team(
-                    names[opponent_name],
+                staff = squad(
+                    names[own],
                     year,
-                    "hitters"
+                    "pitching"
                 )
 
-                progress.progress(90)
+                bar.progress(50)
 
-                if not staff or len(hitters) < 9:
-                    st.error(
-                        "Not enough historical player "
-                        "data was returned."
-                    )
-                    st.session_state.loaded = None
-                else:
+                st.write(
+                    "🏏 Loading opposing hitters "
+                    "and bench..."
+                )
+
+                hitters = squad(
+                    names[opp],
+                    year,
+                    "hitting"
+                )
+
+                bar.progress(90)
+
+                if staff and len(hitters) >= 9:
                     st.session_state.loaded = {
                         "year": year,
-                        "team": team_name,
-                        "opponent": opponent_name,
+                        "team": own,
+                        "opponent": opp,
                         "staff": staff,
                         "hitters": hitters
                     }
 
                     st.session_state.game = None
+                    st.write("✅ Rosters ready")
 
-                progress.progress(100)
+                else:
+                    st.session_state.loaded = None
 
-                loading.update(
-                    label="Historical roster loading complete",
+                    st.error(
+                        "Not enough roster data returned. "
+                        "Try another season or matchup."
+                    )
+
+                bar.progress(100)
+
+                box.update(
+                    label="Roster request finished",
                     state="complete",
                     expanded=False
                 )
 
-    except requests.RequestException as error:
+    except requests.RequestException as exc:
         st.error(
-            "The MLB data service could not "
-            "complete the request."
+            "MLB data could not be loaded. "
+            "Refresh and try again."
         )
-        st.caption(str(error))
+        st.caption(str(exc))
 
 
-# ==========================================
-# STARTER SELECTION
-# ==========================================
+# =====================================
+# START GAME
+# =====================================
 
 loaded = st.session_state.loaded
 
@@ -1053,278 +1114,271 @@ if loaded and st.session_state.game is None:
 
     lookup = {
         p["id"]: p
-        for p in staff
+        for p in starters
     }
 
-    starter_id = st.selectbox(
-        "Choose Your Starting Pitcher",
+    c1, c2 = st.columns(2)
+
+    starter = c1.selectbox(
+        "Starting pitcher",
         [p["id"] for p in starters],
         format_func=lambda pid: (
             f"{lookup[pid]['name']} "
-            f"({hand_label(lookup[pid]['throws'])}) "
-            f"| ERA "
-            f"{lookup[pid]['stats'].get('era', '—')}"
+            f"({hand(lookup[pid]['throws'])}) • "
+            f"ERA "
+            f"{lookup[pid]['stats'].get('era','—')}"
         )
+    )
+
+    mode = c2.selectbox(
+        "Difficulty",
+        [
+            "Rookie",
+            "Pro",
+            "Hall of Fame"
+        ],
+        index=0
     )
 
     if st.button(
         "⚾ PLAY BALL!",
         type="primary"
     ):
-
-        st.session_state.game = create_game(
-            loaded["year"],
-            loaded["team"],
-            loaded["opponent"],
-            loaded["staff"],
-            loaded["hitters"],
-            starter_id
+        st.session_state.game = new_game(
+            loaded,
+            starter,
+            mode
         )
-
         st.rerun()
 
 
-# ==========================================
-# LIVE GAME
-# ==========================================
+# =====================================
+# GAME DASHBOARD
+# =====================================
 
-if st.session_state.game is not None:
+g = st.session_state.game
 
-    game = st.session_state.game
-
-    pitcher = current_pitcher(game)
-    batter = current_batter(game)
+if g:
+    p = pitcher(g)
+    h = batter(g)
 
     st.subheader(
-        f"{game['year']} | "
-        f"{game['team']} vs. "
-        f"{game['opponent']}"
+        f"{g['year']} {g['team']} "
+        f"vs. {g['opponent']} • {g['mode']}"
     )
 
-    # SCOREBOARD
-
-    boxes = st.columns(5)
-
-    values = [
-        min(game["inning"], 9),
-        game["outs"],
-        game["runs"],
-        game["hits"],
-        game["pitches"][pitcher["id"]]
-    ]
+    cells = st.columns(6)
 
     labels = [
         "Inning",
         "Outs",
         "Runs Allowed",
-        "Hits Allowed",
-        "Pitch Count"
+        "Hits",
+        "Pitch Count",
+        "Strikeouts"
     ]
 
-    for box, label, value in zip(
-        boxes, labels, values
+    numbers = [
+        min(9, g["inning"]),
+        g["outs"],
+        g["runs"],
+        g["hits"],
+        g["pitches"][p["id"]],
+        g["strikeouts"]
+    ]
+
+    for col, label, number in zip(
+        cells, labels, numbers
     ):
-        box.metric(label, value)
+        col.metric(label, number)
 
-    # THREE-COLUMN GAME DASHBOARD
-
-    left, middle, right = st.columns(
-        [1.2, 1.35, 1.2],
+    left, center, right = st.columns(
+        [1.15, 1.32, 1.15],
         gap="medium"
     )
 
-    # =====================================
-    # LEFT COLUMN: PITCHING STAFF
-    # =====================================
+    # =================================
+    # PITCHING STAFF
+    # =================================
 
     with left:
+        st.markdown("### ⚾ Pitching staff")
 
-        st.markdown("### ⚾ Pitching Staff")
+        rows = []
 
-        staff_rows = []
+        for x in g["staff"]:
+            pid = x["id"]
 
-        for p in game["staff"]:
+            if pid == g["pitcher"]:
+                status = "🔵 MOUND"
 
-            pid = p["id"]
-
-            if pid == game["pitcher"]:
-                status = "🔵 ON MOUND"
-            elif pid in game["used"]:
+            elif pid in g["used"]:
                 status = "USED"
-            elif pid in game["ready"]:
+
+            elif pid in g["ready"]:
                 status = "🟢 READY"
-            elif pid in game["warming"]:
-                status = "🟡 WARMING"
+
+            elif pid in g["warming"]:
+                status = "🟡 WARM"
+
             else:
                 status = "AVAILABLE"
 
-            staff_rows.append({
-                "Pitcher": p["name"],
-                "Role": p["role"],
-                "Hand": hand_label(p["throws"]),
-                "ERA": p["stats"].get("era", "—"),
-                "WHIP": p["stats"].get("whip", "—"),
+            rows.append({
+                "Pitcher": x["name"],
+                "Role": x["role"],
+                "Hand": hand(x["throws"]),
+                "ERA": x["stats"].get(
+                    "era", "—"
+                ),
+                "WHIP": x["stats"].get(
+                    "whip", "—"
+                ),
                 "Status": status
             })
 
         st.dataframe(
-            pd.DataFrame(staff_rows),
-            use_container_width=True,
+            pd.DataFrame(rows),
             hide_index=True,
-            height=270
+            use_container_width=True,
+            height=260
         )
 
         st.write(
-            f"**On the Mound:** {pitcher['name']} "
-            f"({hand_label(pitcher['throws'])})"
+            f"**On mound:** {p['name']} "
+            f"({hand(p['throws'])})"
         )
 
         st.progress(
-            min(1.0, fatigue(game)),
-            text=f"Fatigue: {fatigue(game):.0%}"
+            bound(stamina(g), 0, 1),
+            text=f"Fatigue: {stamina(g):.0%}"
         )
 
         st.caption(
-            f"Pitches thrown: "
-            f"{game['pitches'][pitcher['id']]}"
+            "Stamina uses historical innings "
+            "per appearance. Rookie mode gives "
+            "extra endurance."
         )
 
-        # BULLPEN MANAGEMENT
-
-        if not game["finished"]:
-
-            st.markdown("#### 🔥 Bullpen Management")
+        if not g["finished"]:
+            st.markdown("#### 🔥 Bullpen")
 
             available = [
-                p for p in game["staff"]
-                if p["id"] not in game["used"]
+                x for x in g["staff"]
+                if x["id"] not in g["used"]
             ]
 
-            resting = [
-                p for p in available
-                if p["id"] not in game["ready"]
-                and p["id"] not in game["warming"]
+            cold = [
+                x for x in available
+                if x["id"] not in g["warming"]
+                and x["id"] not in g["ready"]
             ]
 
-            if resting:
-
-                rest_lookup = {
-                    p["id"]: p
-                    for p in resting
+            if cold:
+                byid = {
+                    x["id"]: x
+                    for x in cold
                 }
 
-                warm_choice = st.selectbox(
-                    "Select pitcher to warm up",
-                    list(rest_lookup),
+                pick = st.selectbox(
+                    "Warm up a pitcher",
+                    list(byid),
                     format_func=lambda pid: (
-                        f"{rest_lookup[pid]['name']} "
-                        f"({hand_label(rest_lookup[pid]['throws'])})"
+                        f"{byid[pid]['name']} • "
+                        f"{hand(byid[pid]['throws'])}"
                     )
                 )
 
-                if st.button(
-                    "🔥 WARM UP PITCHER"
-                ):
-                    warm_up(game, warm_choice)
+                if st.button("🔥 WARM UP"):
+                    warm(g, pick)
                     st.rerun()
 
-            if game["warming"]:
+            for pid, progress in g["warming"].items():
+                x = next(
+                    x for x in g["staff"]
+                    if x["id"] == pid
+                )
 
-                for pid, progress in game["warming"].items():
-
-                    p = next(
-                        x for x in game["staff"]
-                        if x["id"] == pid
-                    )
-
-                    st.caption(
-                        f"🟡 {p['name']} "
-                        f"({hand_label(p['throws'])}) "
-                        f"warming: {progress}/2"
-                    )
+                st.caption(
+                    f"🟡 {x['name']} "
+                    f"({hand(x['throws'])}) — "
+                    f"{progress}/2 batters"
+                )
 
             ready = [
-                p for p in available
-                if p["id"] in game["ready"]
+                x for x in available
+                if x["id"] in g["ready"]
             ]
 
             if ready:
-
-                ready_lookup = {
-                    p["id"]: p
-                    for p in ready
+                byid = {
+                    x["id"]: x
+                    for x in ready
                 }
 
-                relief_choice = st.selectbox(
-                    "Ready Pitchers",
-                    list(ready_lookup),
+                incoming = st.selectbox(
+                    "Ready reliever",
+                    list(byid),
                     format_func=lambda pid: (
-                        f"{ready_lookup[pid]['name']} "
-                        f"({hand_label(ready_lookup[pid]['throws'])})"
+                        f"{byid[pid]['name']} • "
+                        f"{hand(byid[pid]['throws'])}"
                     )
                 )
 
                 reason = st.selectbox(
-                    "Reason for Pitching Change",
+                    "Your reason",
                     [
                         "Fatigue",
-                        "Left/Right Matchup",
-                        "Runner in Scoring Position",
-                        "Strikeout Ability",
-                        "Protect the Shutout"
+                        "Handedness matchup",
+                        "Strikeout ability",
+                        "Runners on base",
+                        "Save the shutout"
                     ]
                 )
 
                 if st.button(
-                    "🔁 MAKE PITCHING CHANGE",
-                    disabled=not can_change(game),
+                    "🔁 MAKE CHANGE",
+                    disabled=not change_legal(g),
                     type="primary"
                 ):
-                    change_pitcher(
-                        game,
-                        relief_choice,
+                    bring_in(
+                        g,
+                        incoming,
                         reason
                     )
                     st.rerun()
 
-            if not can_change(game):
+            if not change_legal(g):
                 st.caption(
-                    "Pitcher must face three batters "
+                    "Three-batter minimum, "
                     "or finish the half-inning."
                 )
 
-    # =====================================
-    # MIDDLE COLUMN: LIVE DIAMOND
-    # =====================================
+    # =================================
+    # LIVE GAME
+    # =================================
 
-    with middle:
+    with center:
+        st.markdown("### 🏟️ Live diamond")
 
-        st.markdown("### 🏟️ Live Diamond")
-
-        # Fixed SVG field rendering
-        draw_field(game)
+        diamond(g)
 
         st.write(
-            f"**At Bat:** {batter['name']} "
-            f"({batting_hand(batter['bats'])})"
+            f"**At bat:** {h['name']} ({h['bats']}) "
+            f" | **Pitcher:** {p['name']} "
+            f"({hand(p['throws'])})"
         )
 
-        st.write(
-            f"**Pitcher:** {pitcher['name']} "
-            f"({hand_label(pitcher['throws'])})"
-        )
-
-        if game["finished"]:
-
-            if game["runs"] == 0:
+        if g["finished"]:
+            if g["runs"] == 0:
                 st.success(
                     "🏆 SHUTOUT! "
-                    "Nine scoreless innings!"
+                    "27 outs, zero runs!"
                 )
             else:
                 st.info(
-                    f"Final: {game['runs']} "
-                    "runs allowed."
+                    f"Final: {g['runs']} runs allowed. "
+                    "You still completed the challenge!"
                 )
 
         elif st.button(
@@ -1332,281 +1386,186 @@ if st.session_state.game is not None:
             type="primary",
             use_container_width=True
         ):
-
-            simulate_at_bat(game)
+            simulate(g)
             st.rerun()
 
-        st.markdown("#### 📣 Play-by-Play")
+        st.markdown("#### 📣 Play-by-play")
+        st.info(g["last_play"])
 
-        for entry in reversed(game["log"][-6:]):
-            st.caption(entry)
+        for line in reversed(g["log"][-5:]):
+            st.caption(line)
 
-    # =====================================
-    # RIGHT COLUMN: OPPOSING LINEUP
-    # =====================================
+    # =================================
+    # OPPOSING LINEUP AND SCOUTING
+    # =================================
 
     with right:
+        st.markdown("### 🧢 Opposing lineup")
 
-        st.markdown("### 🧢 Opposing Lineup")
+        spot = g["spot"] % 9
+        table = []
 
-        current_spot = game["spot"] % 9
+        for i, x in enumerate(g["lineup"]):
 
-        rows = []
+            if i == spot:
+                label = "🔴 AT BAT"
 
-        for index, player in enumerate(
-            game["lineup"]
-        ):
+            elif i == (spot + 1) % 9:
+                label = "🟡 ON DECK"
 
-            if index == current_spot:
-                status = "🔴 AT BAT"
-
-            elif index == (
-                current_spot + 1
-            ) % 9:
-                status = "🟡 ON DECK"
-
-            elif index == (
-                current_spot + 2
-            ) % 9:
-                status = "⚪ IN HOLE"
+            elif i == (spot + 2) % 9:
+                label = "⚪ NEXT"
 
             else:
-                status = ""
+                label = ""
 
-            rows.append({
-                "#": index + 1,
-                "Status": status,
-                "Batter": player["name"],
-                "Bats": batting_hand(
-                    player["bats"]
-                ),
-                "AVG": player["stats"].get(
+            table.append({
+                "#": i + 1,
+                "Status": label,
+                "Batter": x["name"],
+                "Bats": x["bats"],
+                "AVG": x["stats"].get(
                     "avg", "—"
                 )
             })
 
         st.dataframe(
-            pd.DataFrame(rows),
+            pd.DataFrame(table),
             hide_index=True,
             use_container_width=True,
-            height=270
+            height=260
         )
 
-        # =================================
-        # DANGER SCOUTING
-        # =================================
+        st.markdown("### 🧠 Situation room")
 
-        danger, danger_message = danger_status(
-            game
-        )
+        alert = danger(g)
 
-        st.markdown("### 🧠 Situation Room")
+        if alert:
+            st.error(alert)
 
-        if danger:
+            st.write(
+                f"**{p['name']} vs. {h['name']}**"
+            )
 
-            st.error(danger_message)
+            if g["mode"] != "Hall of Fame":
+                h2h = matchup(
+                    p["id"],
+                    h["id"],
+                    g["year"]
+                )
 
-            st.markdown(
-                "#### 🚨 Pitcher vs. Batter"
+                if (
+                    h2h
+                    and h2h.get("atBats") is not None
+                ):
+                    st.write(
+                        f"Verified matchup: "
+                        f"**{fmt(h2h.get('hits'))} H / "
+                        f"{fmt(h2h.get('atBats'))} AB** "
+                        f"• AVG "
+                        f"**{fmt(h2h.get('avg'))}** "
+                        f"• K "
+                        f"**{fmt(h2h.get('strikeOuts'))}**"
+                    )
+
+                    if val(
+                        h2h.get("atBats")
+                    ) < 20:
+                        st.warning(
+                            "Small sample: be careful "
+                            "about conclusions."
+                        )
+
+                else:
+                    st.caption(
+                        "Verified pitcher-batter "
+                        "record unavailable; season "
+                        "totals shown below."
+                    )
+
+            st.write(
+                f"Batter: AVG "
+                f"**{h['stats'].get('avg','—')}** "
+                f"• OBP "
+                f"**{h['stats'].get('obp','—')}** "
+                f"• HR "
+                f"**{h['stats'].get('homeRuns','—')}**"
             )
 
             st.write(
-                f"**{pitcher['name']}** "
-                f"({hand_label(pitcher['throws'])}) "
-                f"vs. **{batter['name']}** "
-                f"({batting_hand(batter['bats'])})"
+                f"Pitcher: ERA "
+                f"**{p['stats'].get('era','—')}** "
+                f"• WHIP "
+                f"**{p['stats'].get('whip','—')}** "
+                f"• K "
+                f"**{p['stats'].get('strikeOuts','—')}**"
             )
 
-            with st.spinner(
-                "Checking MLB historical matchup..."
-            ):
-                matchup = head_to_head(
-                    pitcher["id"],
-                    batter["id"],
-                    game["year"]
-                )
-
-            if matchup:
-
-                m1, m2, m3 = st.columns(3)
-
-                m1.metric(
-                    "Hits",
-                    matchup.get("hits", "—")
-                )
-
-                m2.metric(
-                    "At-Bats",
-                    matchup.get("atBats", "—")
-                )
-
-                m3.metric(
-                    "Strikeouts",
-                    matchup.get(
-                        "strikeOuts", "—"
-                    )
-                )
-
-                st.metric(
-                    "Head-to-Head AVG",
-                    matchup.get("avg", "—")
-                )
-
-                if num(
-                    matchup.get("atBats")
-                ) < 20:
-                    st.warning(
-                        "Small sample size! "
-                        "Be careful making predictions."
-                    )
-
-            else:
-
+            if g["mode"] == "Rookie":
                 st.info(
-                    "No verified head-to-head "
-                    "record was returned for "
-                    "these players."
+                    "Consider pitcher fatigue, "
+                    "hitter handedness, and how "
+                    "many runners could score."
                 )
-
-            st.markdown(
-                "#### 📊 Season Statistics"
-            )
-
-            s1, s2 = st.columns(2)
-
-            with s1:
-                st.metric(
-                    "Batter AVG",
-                    batter["stats"].get(
-                        "avg", "—"
-                    )
-                )
-
-                st.metric(
-                    "Batter OBP",
-                    batter["stats"].get(
-                        "obp", "—"
-                    )
-                )
-
-            with s2:
-                st.metric(
-                    "Pitcher ERA",
-                    pitcher["stats"].get(
-                        "era", "—"
-                    )
-                )
-
-                st.metric(
-                    "Pitcher WHIP",
-                    pitcher["stats"].get(
-                        "whip", "—"
-                    )
-                )
-
-            bf = max(
-                1,
-                num(
-                    pitcher["stats"].get(
-                        "battersFaced"
-                    )
-                )
-            )
-
-            k_rate = (
-                num(
-                    pitcher["stats"].get(
-                        "strikeOuts"
-                    )
-                ) / bf
-            )
-
-            walk_rate = (
-                num(
-                    pitcher["stats"].get(
-                        "baseOnBalls"
-                    )
-                ) / bf
-            )
-
-            st.write(
-                f"**Strikeout rate:** {pct(k_rate)}"
-            )
-
-            st.write(
-                f"**Walk rate:** {pct(walk_rate)}"
-            )
-
-            st.info(
-                "MANAGER'S DECISION: "
-                "Should this pitcher stay in "
-                "or should you use the bullpen?"
-            )
 
         else:
-
-            st.success(
-                "✅ No immediate danger."
-            )
+            st.success("No immediate danger")
 
             st.caption(
-                "Detailed scouting appears "
-                "when the game enters a "
-                "dangerous situation."
+                f"Current batter season AVG: "
+                f"{h['stats'].get('avg','—')}"
             )
 
-            st.write(
-                f"Current Batter: "
-                f"**{batter['name']}**"
-            )
+    # =================================
+    # POSTGAME ANALYSIS
+    # =================================
 
-            st.write(
-                f"Season AVG: "
-                f"**{batter['stats'].get('avg', '—')}**"
-            )
-
-    # =====================================
-    # MANAGER LOG AND NEW GAME
-    # =====================================
-
-    with st.expander("📋 Manager Decision Log"):
-
-        if game["decisions"]:
-            st.dataframe(
-                pd.DataFrame(game["decisions"]),
-                hide_index=True
-            )
-        else:
-            st.write(
-                "No pitching changes yet."
-            )
-
-    if game["finished"]:
-
-        report = pd.DataFrame(
-            game["decisions"],
-            columns=[
-                "Inning", "Outs", "Removed",
-                "Entered", "Hand", "Reason"
-            ]
-        ).to_csv(index=False)
-
-        st.download_button(
-            "Download Manager Report",
-            data=report,
-            file_name="manager_report.csv",
-            mime="text/csv"
+    with st.expander(
+        "📋 Decisions & learning report"
+    ):
+        st.metric(
+            "Manager score (approx.)",
+            bound(g["score"], 0, 100)
         )
 
-    if st.button("START A NEW GAME"):
+        st.caption(
+            "Teaching score: rewards some timely "
+            "changes and deducts for runs allowed. "
+            "Not an objective MLB management rating."
+        )
+
+        if g["decisions"]:
+            st.dataframe(
+                pd.DataFrame(g["decisions"]),
+                hide_index=True
+            )
+
+        st.write(
+            f"Strikeouts: {g['strikeouts']} "
+            f"• Double plays: {g['double_plays']} "
+            f"• Runs allowed: {g['runs']}"
+        )
+
+        if g["finished"]:
+            st.download_button(
+                "Download decisions (CSV)",
+                pd.DataFrame(
+                    g["decisions"]
+                ).to_csv(index=False),
+                "manager_report.csv",
+                "text/csv"
+            )
+
+    if st.button("START NEW GAME"):
         st.session_state.game = None
         st.session_state.loaded = None
         st.rerun()
 
 
 st.caption(
-    "Sports by the Numbers | "
-    "Real MLB historical statistics support "
-    "an educational baseball simulation. "
-    "At-bat results and fatigue are simulated."
+    "Historical player data: MLB Stats API. "
+    "At-bats, handedness adjustments, stamina, "
+    "baserunning and decisions are modeled for "
+    "educational play. Lineups approximate season "
+    "regulars, not verified game-day orders."
 )
