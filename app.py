@@ -265,6 +265,10 @@ def event_alert(g, result, runs, inning_before, outs_before, bases_before):
         alerts.append('✨ NO-HITTER WATCH — no hits allowed through '+str(inning_before)+' innings!')
     if g['runs']==0 and inning_before>=7 and g['outs']==0 and g['inning']>inning_before:
         alerts.append('🔒 SHUTOUT WATCH — '+str(inning_before)+' scoreless innings in the books!')
+    if g.get('last_inning_ended') is not None:
+        completed=g['last_inning_ended']
+        inning_r= 'scoreless' if g['runs']==g.get('inning_start_runs',g['runs']) else 'complete'
+        alerts.insert(0, f'⚾ END OF INNING {completed} — three outs recorded!')
     if g['finished'] and g['runs']==0:
         alerts.append('🏆 SHUTOUT COMPLETE — 27 outs, zero runs allowed!')
     if alerts:
@@ -290,7 +294,7 @@ def starting_game(data, starter, mode):
       mound_visits=5,visit_boost={x['id']:0 for x in staff},confidence_events=[],
       park=data.get('park',park_info(data['team'],data['year'])),
       team_defense=data.get('team_defense',{'rating':5,'source':'Neutral modeled rating'}),
-      errors=0,dramatic_alert='',event_history=[])
+      errors=0,dramatic_alert='',event_history=[],last_inning_ended=None)
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -503,7 +507,9 @@ def walk_bases(g):
 def after_batter(g):
     g['spot']+=1;warm_tick(g)
     g['play_serial']+=1
+    g['last_inning_ended']=None
     if g['outs']>=3:
+        g['last_inning_ended']=g['inning']
         g['log'].append(f"End of inning {g['inning']} — {g['runs']} runs allowed.")
         if g.get('jam_escaped') and g['runs']==g['inning_start_runs'] and 'Escape Artist' not in g['achievements']:
             g['achievements'].append('Escape Artist')
@@ -611,6 +617,52 @@ STADIUM_KEY_BY_NAME = {
     'PNC Park':'pnc','Petco Park':'petco',
 }
 
+def fenway_architecture_backdrop():
+    """Original stylized Fenway overhead art, not an aerial photograph or survey."""
+    parts = [
+       '<rect width="550" height="360" fill="#173e3b"/>',
+       '<path d="M0 0 H550 V157 L486 112 L418 72 L342 41 L253 31 L167 50 L99 84 L29 134 L0 153 Z" fill="#414b49"/>',
+       '<path d="M0 0 H550 V107 L487 87 L417 52 L334 19 L244 9 L145 29 L70 74 L0 109 Z" fill="#686b61"/>',
+       '<g fill="#986b53" stroke="#c49c80" stroke-width="1">'
+       '<rect x="11" y="4" width="81" height="44" rx="2"/><rect x="455" y="5" width="77" height="41" rx="2"/>'
+       '<rect x="96" y="-8" width="52" height="41"/><rect x="373" y="0" width="54" height="29"/></g>',
+       '<g stroke="#d6b198" stroke-width="1" opacity=".7">'
+       '<path d="M11 14 H92 M11 25 H92 M11 36 H92 M455 17 H532 M455 30 H532"/>'
+       '<path d="M25 5 V47 M40 5 V47 M55 5 V47 M70 5 V47 M470 5 V45 M485 5 V45 M500 5 V45 M515 5 V45"/></g>',
+       '<path d="M-2 169 L-2 45 Q75 18 126 27 L163 10 Q265 -26 345 12 Q450 22 550 91 L550 179" fill="none" stroke="#0c2528" stroke-width="46"/>',
+       '<path d="M0 166 L0 52 Q72 29 124 38 L164 23 Q264 -13 344 23 Q446 34 550 105 L550 178" fill="none" stroke="#a42734" stroke-width="33"/>',
+       '<path d="M0 166 L0 52 Q72 29 124 38 L164 23 Q264 -13 344 23 Q446 34 550 105 L550 178" fill="none" stroke="#143b41" stroke-width="26" stroke-dasharray="1 5"/>',
+       '<path d="M0 166 L0 52 Q72 29 124 38 L164 23 Q264 -13 344 23 Q446 34 550 105 L550 178" fill="none" stroke="#f0c9b2" stroke-width="2"/>',
+       '<g stroke="#9ea6a2" stroke-width="2" opacity=".75">'
+       '<path d="M50 32 V135 M480 43 V135 M120 18 V75 M409 22 V73"/></g>',
+       '<g fill="#fff3cd"><circle cx="50" cy="32" r="5"/><circle cx="480" cy="43" r="5"/></g>',
+       '<g><rect x="56" y="2" width="55" height="24" rx="3" fill="#f1ebdb" stroke="#c62d36" stroke-width="2"/>'
+       '<text x="83" y="18" text-anchor="middle" font-size="12" font-weight="bold" fill="#ce3038">CITGO</text></g>'
+    ]
+    return ''.join(parts)
+
+
+def fenway_architecture_foreground():
+    """Distinctive Fenway features anchored around the existing interactive diamond."""
+    return """<g>
+       <path d="M18 134 L18 66 L101 66 L101 45 L184 28 L248 15 L338 32 L419 51 L532 98" fill="none" stroke="#0b2728" stroke-width="16" stroke-linejoin="round"/>
+       <path d="M18 134 L18 66 L101 66" fill="none" stroke="#17633c" stroke-width="19" stroke-linejoin="miter"/>
+       <path d="M18 134 L18 66 L101 66" fill="none" stroke="#62a777" stroke-width="2"/>
+       <path d="M101 66 L101 45 L184 28 L248 15 L338 32 L419 51 L532 98" fill="none" stroke="#1c6752" stroke-width="10"/>
+       <g transform="translate(17,75)"><rect width="72" height="35" rx="2" fill="#164b33" stroke="#f4dfad"/>
+       <text x="36" y="12" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff2c0">GREEN</text>
+       <text x="36" y="23" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff2c0">MONSTER</text>
+       <text x="36" y="32" text-anchor="middle" font-size="6" fill="#d6e7bc">37 FT WALL</text></g>
+       <path d="M105 45 V84" stroke="#fed245" stroke-width="4"/>
+       <g transform="translate(283,26)"><rect x="-45" y="-13" width="90" height="23" rx="3" fill="#183d32" stroke="#cdddbb"/>
+       <text x="0" y="1" text-anchor="middle" fill="white" font-size="9" font-weight="bold">FENWAY PARK</text></g>
+       <g fill="#d8dfcc" opacity=".95"><circle cx="154" cy="44" r="2"/><circle cx="171" cy="40" r="2"/><circle cx="189" cy="37" r="2"/><circle cx="390" cy="51" r="2"/></g>
+       <path d="M529 98 L545 110" stroke="#ffe4a4" stroke-width="4"/>
+       <g transform="translate(443,83)"><rect width="84" height="17" rx="2" fill="#223d43" stroke="#f4d2a0"/>
+       <text x="42" y="11" text-anchor="middle" font-size="9" font-weight="bold" fill="white">PESKY'S POLE →</text></g>
+       </g>"""
+
+
 def diamond(g):
     def marker(x, y, occupied):
         fill = '#ffb33d' if occupied else '#f5e8c9'
@@ -624,6 +676,9 @@ def diamond(g):
         blueprint={'wall':'M18 115 Q275 -40 532 115','bowl':'M5 147 Q275 -70 545 147','accent':'#93b4ad','label':'HOME BALLPARK','landmark':'','shape':'CLASSIC BALLPARK'}
     fence=blueprint['wall']
     bowl=blueprint['bowl']
+    fenway_mode=stadium_key=='fenway'
+    stadium_back=fenway_architecture_backdrop() if fenway_mode else ''
+    stadium_front=fenway_architecture_foreground() if fenway_mode else blueprint['landmark']
     a,b,c=g['bases']
     previous=g.get('prior_bases',[False,False,False])
     points=[(428,177),(275,66),(122,177)]
@@ -641,6 +696,11 @@ def diamond(g):
     detail=escape(g.get('play_detail',''))
     runs=g.get('play_runs',0)
     ribbon=f'<div class="score">+{runs} RUNS</div>' if runs else ''
+    inning_end=g.get('last_inning_ended')
+    if inning_end is not None:
+        ribbon += f'<div class="inning-finish">⚾ END OF INNING {int(inning_end)} <span>· THREE OUTS</span></div>'
+        if g.get('finished'):
+            ribbon += '<div class="game-finish">FINAL — GAME OVER</div>'
     result=(f'<div class="result"><div class="broadcast-tag">⚾ LAST PLAY</div><div class="big">{headline}</div><div class="detail">{detail}</div>{ribbon}</div>') if headline else ''
     if g.get('dramatic_alert'):
         result+='<div class="event-strip">'+escape(g["dramatic_alert"])+ '</div>'
@@ -653,6 +713,9 @@ def diamond(g):
     *{{box-sizing:border-box}}body{{margin:0;background:transparent;font-family:Arial,sans-serif;overflow:hidden}}
     .event-strip{{position:absolute;bottom:5px;left:3%;width:94%;text-align:center;background:#102c43ee;color:#ffc16a;padding:5px;border:1px solid #e9a236;border-radius:7px;font:800 11px Arial;z-index:4}}
     .stadium{{position:relative;width:100%;height:310px;overflow:hidden;border-radius:16px;background:#092c29}}
+    .inning-finish{{margin-top:12px;padding:10px 5px;background:#bd3039;border:1px solid #ffdfac;color:white;border-radius:9px;font:900 18px Arial;letter-spacing:1.1px;box-shadow:0 3px 18px #0009}}
+    .inning-finish span{{font:700 11px Arial;color:#fff0bf}}
+    .game-finish{{font:900 15px Arial;margin-top:8px;color:#f7d68f}}
     svg{{width:100%;height:100%;display:block}}
     .result{{position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);width:87%;background:rgba(6,22,35,.92);border:3px solid #ffb139;border-radius:16px;padding:17px;text-align:center;box-shadow:0 15px 30px #0009;animation:pop .38s ease-out, fadeAway .35s ease-in 3.2s forwards;z-index:5}}
     .broadcast-tag{{color:#ffb33d;font:800 10px Arial;letter-spacing:2px;margin-bottom:6px}}
@@ -676,7 +739,7 @@ def diamond(g):
       <path d="{bowl}" fill="none" stroke="#132331" stroke-width="3" stroke-dasharray="4 8"/>
       <path d="{fence} L550 360 L0 360Z" fill="url(#grass)"/>
       <path d="{fence}" stroke="#f1d18a" stroke-width="7" fill="none"/>
-      {blueprint['landmark']}
+      {stadium_front}
       <path d="M275 330 L86 177 L275 35 L464 177 Z" fill="#c58b55" stroke="#f3d6a6" stroke-width="3"/>
       <path d="M275 296 L122 177 L275 66 L428 177 Z" fill="#287247"/>
       <path d="M275 330 L8 110 M275 330 L542 110" stroke="#f6eed9" stroke-width="2"/>
@@ -906,7 +969,7 @@ def safe_career_import(raw):
     return clean_manager_name(data.get('manager','Manager')),cleaned
 
 
-st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.1")
+st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.2")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
