@@ -7,7 +7,27 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="You're the Manager", page_icon="⚾", layout="wide")
-st.markdown("""<style>.block-container{max-width:1800px;padding-top:.55rem}h1{color:#f47721}div[data-testid=stMetric]{background:#17364a;padding:8px;border-radius:9px}div[data-testid=stMetric] *{color:white!important}</style>""", unsafe_allow_html=True)
+st.markdown("""<style>
+:root {--orange:#f58b31;--navy:#102338;--cream:#f7e7c5}
+.block-container{max-width:1880px;padding-top:.35rem;padding-bottom:1.2rem}
+h1,h2,h3{font-family:Arial,sans-serif;letter-spacing:.2px}
+h1{color:#e87623;font-weight:900!important}
+[data-testid="stMetric"]{background:linear-gradient(135deg,#132e46,#1c4b5a);padding:12px;border:1px solid #3a6870;border-radius:12px}
+[data-testid="stMetric"] *{color:#fff!important}
+[data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px}
+.stButton>button[kind="primary"]{background:#e76e21;color:white;font-weight:800;border-radius:10px;border:0}
+.stButton>button{border-radius:10px;font-weight:650}
+[data-testid="stDataFrame"]{border-radius:10px;overflow:hidden}
+.broadcast{background:linear-gradient(100deg,#0e253b,#20506a);border:1px solid #376175;color:#fff;padding:13px 20px;border-radius:15px;margin:8px 0 13px}
+.broadcast .eyebrow{font:700 12px Arial;letter-spacing:2px;color:#ffb561}
+.broadcast .headline{font:900 clamp(18px,2.6vw,30px) Arial;margin:5px 0}
+.broadcast .detail{color:#dae6ec;font:14px Arial}
+.pitcher-card{border-radius:15px;background:linear-gradient(125deg,#173349,#294e5a);padding:14px;color:#fff;border:1px solid #3e7280;margin:8px 0}
+.pitcher-card .label{letter-spacing:1.6px;color:#ffb868;font:700 11px Arial}
+.pitcher-card .name{font:800 21px Arial;margin:6px 0}
+.pitcher-card .stats{font:13px Arial;color:#d2e2e6}
+.lineup-current{font-weight:800}
+</style>""", unsafe_allow_html=True)
 API = 'https://statsapi.mlb.com/api/v1'
 
 
@@ -361,35 +381,42 @@ def danger(g):
 
 
 def diamond(g):
-    def base(x,y,on):
-        fill='#FFBA32' if on else '#FFFFFF'
-        return f'<rect x="{x-9}" y="{y-9}" width="18" height="18" transform="rotate(45 {x} {y})" fill="{fill}" stroke="#174832" stroke-width="2"/>'
+    def marker(x, y, occupied):
+        fill = '#ffb33d' if occupied else '#f5e8c9'
+        halo = '<circle cx="%s" cy="%s" r="20" fill="#ffb33d" opacity=".2"/>' % (x,y) if occupied else ''
+        return halo + f'<rect x="{x-10}" y="{y-10}" width="20" height="20" transform="rotate(45 {x} {y})" fill="{fill}" stroke="#153c35" stroke-width="2"/>'
     a,b,c=g['bases']
-    svg=f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 245" style="width:100%;height:240px"><rect width="400" height="245" rx="13" fill="#16563D"/><path d="M200 222 L63 112 L200 12 L337 112 Z" fill="#BA8C58" stroke="#F0DDB4" stroke-width="3"/><path d="M200 200 L91 112 L200 34 L309 112 Z" fill="#267950"/><path d="M200 222 L20 76 M200 222 L380 76" stroke="white" stroke-width="2"/>{base(302,112,a)}{base(200,29,b)}{base(98,112,c)}{base(200,216,False)}<circle cx="200" cy="124" r="12" fill="#D7B27A"/><rect x="193" y="122" width="14" height="4" fill="white"/><text x="12" y="18" fill="white" font-size="12">Yellow = occupied base</text></svg>'''
     headline=escape(g.get('play_result',''))
     detail=escape(g.get('play_detail',''))
     runs=g.get('play_runs',0)
-    scoring=f"<div class='scoring'>+{runs} RUN{'S' if runs != 1 else ''}</div>" if runs else ''
-    overlay=(f"<div class='result'><div class='headline'>{headline}</div>"
-             f"<div class='detail'>{detail}</div>{scoring}</div>") if headline else ''
+    ribbon=f'<div class="score">+{runs} RUNS</div>' if runs else ''
+    result=(f'<div class="result"><div class="big">{headline}</div><div class="detail">{detail}</div>{ribbon}</div>') if headline else ''
     html=f"""<html><head><style>
-        body {{margin:0;overflow:hidden;background:transparent;font-family:Arial,sans-serif}}
-        .field {{position:relative;width:100%;height:245px}}
-        svg {{width:100%;height:245px}}
-        .result {{position:absolute;left:50%;top:52%;transform:translate(-50%,-50%);
-                 width:88%;box-sizing:border-box;padding:13px 10px;text-align:center;
-                 background:rgba(5,21,34,.91);border:3px solid #FFB234;
-                 border-radius:14px;box-shadow:0 5px 22px rgba(0,0,0,.6);
-                 animation:appear .3s ease-out}}
-        .headline {{font-size:clamp(22px,4vw,44px);font-weight:900;color:#fff;
-                    letter-spacing:1.5px;text-shadow:0 2px 3px #000}}
-        .detail {{font-size:13px;color:#f7e2b9;margin-top:4px}}
-        .scoring {{font-size:18px;font-weight:900;color:#FFBC38;margin-top:6px}}
-        @keyframes appear {{from {{opacity:0;transform:translate(-50%,-55%) scale(.88)}}
-                            to {{opacity:1;transform:translate(-50%,-50%) scale(1)}}}}
-        </style></head><body><div class='field'>{svg}{overlay}</div></body></html>"""
-    components.html(html,height=250,scrolling=False)
-
+    *{{box-sizing:border-box}}body{{margin:0;background:transparent;font-family:Arial,sans-serif;overflow:hidden}}
+    .stadium{{position:relative;width:100%;height:360px;overflow:hidden;border-radius:16px;background:#092c29}}
+    svg{{width:100%;height:100%;display:block}}
+    .result{{position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);width:87%;background:rgba(6,22,35,.92);border:3px solid #ffb139;border-radius:16px;padding:17px;text-align:center;box-shadow:0 15px 30px #0009;animation:pop .38s ease-out}}
+    .big{{font:900 clamp(27px,5vw,52px) Arial;color:#fff;letter-spacing:1.5px;text-shadow:0 3px 5px #000}}
+    .detail{{font:14px Arial;color:#f3dbaf;margin-top:6px}}.score{{font:900 21px Arial;color:#ffb139;margin-top:8px}}
+    @keyframes pop{{from{{opacity:0;transform:translate(-50%,-50%) scale(.8)}}to{{opacity:1;transform:translate(-50%,-50%) scale(1)}}}}
+    </style></head><body><div class="stadium">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 550 360" preserveAspectRatio="xMidYMid meet">
+      <defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#082439"/><stop offset="1" stop-color="#145039"/></linearGradient>
+      <pattern id="grass" width="48" height="48" patternUnits="userSpaceOnUse" patternTransform="rotate(23)"><rect width="48" height="48" fill="#236b48"/><rect width="24" height="48" fill="#2e7c52"/></pattern></defs>
+      <rect width="550" height="360" fill="url(#sky)"/>
+      <path d="M0 75 Q275 -18 550 75 L550 360 L0 360Z" fill="url(#grass)"/>
+      <path d="M0 75 Q275 -18 550 75" stroke="#e6bf64" stroke-width="7" fill="none"/>
+      <path d="M275 330 L86 177 L275 35 L464 177 Z" fill="#c58b55" stroke="#f3d6a6" stroke-width="3"/>
+      <path d="M275 296 L122 177 L275 66 L428 177 Z" fill="#287247"/>
+      <path d="M275 330 L8 110 M275 330 L542 110" stroke="#f6eed9" stroke-width="2"/>
+      {marker(428,177,a)}{marker(275,66,b)}{marker(122,177,c)}{marker(275,324,False)}
+      <ellipse cx="275" cy="199" rx="22" ry="13" fill="#c99a69"/>
+      <rect x="266" y="197" width="18" height="5" rx="2" fill="#fff"/>
+      <text x="15" y="24" fill="#ffcb80" font-size="15" font-weight="800">SPORTS BY THE NUMBERS</text>
+      <text x="15" y="46" fill="#fff" font-size="12">SHUTOUT CHALLENGE • LIVE</text>
+      <text x="535" y="24" text-anchor="end" fill="#fff" font-size="13">ORANGE = RUNNER ON BASE</text>
+    </svg>{result}</div></body></html>"""
+    components.html(html,height=368,scrolling=False)
 
 def report_grade(g):
     changes=g['decisions']; evidence=sum(1 for x in changes if x['Improved proxy'])
@@ -399,139 +426,154 @@ def report_grade(g):
     return bounded(decision_score,0,100)
 
 
-st.title("⚾ YOU'RE THE MANAGER: SHUTOUT CHALLENGE")
-st.caption('Sports by the Numbers • Historical MLB 2000–2025 • Real statistics, simulated baseball')
-if 'game' not in st.session_state:st.session_state.game=None
-if 'loaded' not in st.session_state:st.session_state.loaded=None
+st.title("⚾ YOU'RE THE MANAGER — STADIUM EDITION")
+st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
+if 'game' not in st.session_state: st.session_state.game=None
+if 'loaded' not in st.session_state: st.session_state.loaded=None
 
-with st.expander('⚙️ Select season and teams',expanded=st.session_state.game is None):
+with st.expander('⚙️ NEW GAME • Season & matchup', expanded=st.session_state.game is None):
     year=st.selectbox('Season',list(range(2025,1999,-1)))
     try:
-        choices={t['name']:t['id'] for t in team_list(year)}
-        a,b=st.columns(2);own=a.selectbox('Your pitching team',list(choices));opp=b.selectbox('Opposing batting team',[x for x in choices if x!=own])
-        if st.button('LOAD MLB ROSTERS',type='primary'):
-            with st.status('Preparing historical matchup...',expanded=True) as status:
-                bar=st.progress(0);st.write('⚾ Loading pitching staff...')
-                staff=load_squad(choices[own],year,'pitching');bar.progress(50)
-                st.write('🏏 Loading hitters and bench...')
-                hitters=load_squad(choices[opp],year,'hitting');bar.progress(90)
+        teams={t['name']:t['id'] for t in team_list(year)}
+        setup_a,setup_b=st.columns(2)
+        own=setup_a.selectbox('Your pitching team',list(teams))
+        opp=setup_b.selectbox('Opposing batting team',[x for x in teams if x!=own])
+        if st.button('LOAD HISTORICAL ROSTERS',type='primary'):
+            st.session_state.loaded=None
+            with st.status('Preparing historical teams...',expanded=True) as status:
+                progress=st.progress(0)
+                st.write('⚾ Loading starters & relievers')
+                staff=load_squad(teams[own],year,'pitching')
+                progress.progress(50)
+                st.write('🏏 Building batting lineup and bench')
+                hitters=load_squad(teams[opp],year,'hitting')
+                progress.progress(90)
                 if staff and len(hitters)>=9:
                     st.session_state.loaded=dict(year=year,team=own,opponent=opp,staff=staff,hitters=hitters)
-                    st.session_state.game=None;st.write('✅ Rosters ready')
-                else:st.error('Insufficient historical roster data. Try another season/team.')
-                bar.progress(100);status.update(label='Roster request complete',state='complete',expanded=False)
-    except requests.RequestException as error:st.error('MLB data temporarily unavailable.');st.caption(str(error))
+                    st.session_state.game=None
+                    status.update(label='✅ Teams loaded',state='complete',expanded=False)
+                else:
+                    st.error('Not enough roster data loaded. Try another season or matchup.')
+                    status.update(label='Roster incomplete',state='error',expanded=True)
+                progress.progress(100)
+    except requests.RequestException as err:
+        st.error('MLB data unavailable right now.');st.caption(str(err))
 
 loaded=st.session_state.loaded
 if loaded and st.session_state.game is None:
-    starters=[x for x in loaded['staff'] if x['role']=='SP'] or loaded['staff'];byid={p['id']:p for p in starters}
-    a,b=st.columns(2)
-    chosen=a.selectbox('Starting pitcher',list(byid),format_func=lambda pid:f"{byid[pid]['name']} ({throwing(byid[pid]['throws'])}) — ERA {byid[pid]['stats'].get('era','—')}")
-    difficulty=b.selectbox('Difficulty',['Rookie','Pro','Hall of Fame'])
+    starters=[x for x in loaded['staff'] if x['role']=='SP'] or loaded['staff']
+    by_id={p['id']:p for p in starters}
+    s1,s2=st.columns(2)
+    starter=s1.selectbox('Choose your starting pitcher',list(by_id),format_func=lambda pid:f"{by_id[pid]['name']} • {throwing(by_id[pid]['throws'])} • ERA {by_id[pid]['stats'].get('era','—')}")
+    difficulty=s2.selectbox('Difficulty',['Rookie','Pro','Hall of Fame'])
     if st.button('⚾ PLAY BALL!',type='primary'):
-        st.session_state.game=starting_game(loaded,chosen,difficulty);st.rerun()
+        st.session_state.game=starting_game(loaded,starter,difficulty)
+        st.rerun()
 
 g=st.session_state.game
 if g:
     p=pitcher(g);h=batter(g)
-    st.subheader(f"{g['year']} {g['team']} vs. {g['opponent']} • {g['mode']}")
-    metrics=st.columns(6)
-    for col,label,value in zip(metrics,['Inning','Outs','Runs','Hits','Pitches','K'],[min(9,g['inning']),g['outs'],g['runs'],g['hits'],g['pitches'][p['id']],g['strikeouts']]):col.metric(label,value)
-    left,center,right=st.columns([1.15,1.32,1.15],gap='medium')
+    st.markdown(f'''<div class="broadcast"><div class="eyebrow">LIVE GAME • {g['year']} SEASON • {escape(g['mode'].upper())}</div><div class="headline">{escape(g['team'])} vs. {escape(g['opponent'])}</div><div class="detail">Manage your staff. Protect the shutout. Record 27 outs.</div></div>''',unsafe_allow_html=True)
+    metric_cols=st.columns(6)
+    for col,label,value in zip(metric_cols,['INNING','OUTS','RUNS ALLOWED','HITS','PITCHES','STRIKEOUTS'],[min(9,g['inning']),g['outs'],g['runs'],g['hits'],g['pitches'][p['id']],g['strikeouts']]):
+        col.metric(label,value)
+    left,center,right=st.columns([1.05,1.9,1.05],gap='medium')
     with left:
-        st.markdown('### ⚾ Pitching staff')
-        staff_rows=[]
-        for x in g['staff']:
-            pid=x['id'];status='🔵 MOUND' if pid==g['pitcher'] else 'USED' if pid in g['used'] else '🟢 READY' if pid in g['ready'] else '🟡 WARMING' if pid in g['warming'] else 'AVAILABLE'
-            staff_rows.append(dict(Pitcher=x['name'],Role=x['role'],Hand=throwing(x['throws']),ERA=x['stats'].get('era','—'),WHIP=x['stats'].get('whip','—'),Status=status))
-        st.dataframe(pd.DataFrame(staff_rows),hide_index=True,use_container_width=True,height=265)
-        st.write(f"**On mound:** {p['name']} ({throwing(p['throws'])})")
+        st.markdown('### 🧢 Your dugout')
+        st.markdown(f'''<div class="pitcher-card"><div class="label">ON THE MOUND • {throwing(p['throws'])} • {p['role']}</div><div class="name">{escape(p['name'])}</div><div class="stats">ERA {escape(str(p['stats'].get('era','—')))} &nbsp; | &nbsp; WHIP {escape(str(p['stats'].get('whip','—')))} &nbsp; | &nbsp; Pitches {g['pitches'][p['id']]}</div></div>''',unsafe_allow_html=True)
         st.progress(bounded(fatigue(g,p),0,1),text=f"Fatigue {fatigue(g,p):.0%}")
+        with st.expander('Pitching staff • SP / RP',expanded=False):
+            status_rows=[]
+            for x in g['staff']:
+                pid=x['id'];status='MOUND' if pid==g['pitcher'] else 'USED' if pid in g['used'] else 'READY' if pid in g['ready'] else 'WARMING' if pid in g['warming'] else 'AVAILABLE'
+                status_rows.append(dict(Pitcher=x['name'],Role=x['role'],Hand=throwing(x['throws']),ERA=x['stats'].get('era','—'),WHIP=x['stats'].get('whip','—'),Status=status))
+            st.dataframe(pd.DataFrame(status_rows),hide_index=True,use_container_width=True,height=270)
         if not g['finished']:
-            st.markdown('#### 🔥 Bullpen')
+            st.markdown('#### 🔥 Interactive bullpen')
             available=[x for x in g['staff'] if x['id'] not in g['used']]
             cold=[x for x in available if x['id'] not in g['warming'] and x['id'] not in g['ready']]
             if cold:
                 options={x['id']:x for x in cold}
-                pick=st.selectbox('Warm up',list(options),format_func=lambda pid:f"{options[pid]['name']} • {throwing(options[pid]['throws'])}")
-                if st.button('🔥 WARM UP'):warm(g,pick);st.rerun()
-            for pid,progress in g['warming'].items():st.caption(f"🟡 {next(x['name'] for x in g['staff'] if x['id']==pid)}: {progress}/2 batters")
+                pick=st.selectbox('Select reliever',list(options),format_func=lambda pid:f"{options[pid]['name']} • {throwing(options[pid]['throws'])}")
+                if st.button('🔥 WARM UP',use_container_width=True):
+                    warm(g,pick);st.rerun()
+            for pid,progress in g['warming'].items():
+                who=next(x['name'] for x in g['staff'] if x['id']==pid)
+                st.warning(f'{who}: warming {progress}/2 batters')
             ready=[x for x in available if x['id'] in g['ready']]
             if ready:
-                options={x['id']:x for x in ready}
-                chosen=st.selectbox('Ready pitcher',list(options),format_func=lambda pid:f"{options[pid]['name']} • {throwing(options[pid]['throws'])}")
-                reason=st.selectbox('Reason',['Fatigue','Matchup','Strikeout ability','Runners on base','Protect shutout'])
-                if st.button('🔁 MAKE CHANGE',disabled=not legal_change(g)):
-                    bring_in(g,chosen,reason);st.rerun()
-            if not legal_change(g):st.caption('Three-batter minimum, or finish the half-inning.')
+                opts={x['id']:x for x in ready}
+                incoming=st.selectbox('Ready pitcher',list(opts),format_func=lambda pid:f"{opts[pid]['name']} • {throwing(opts[pid]['throws'])}")
+                reason=st.selectbox('Reason',['Fatigue','Handedness matchup','Strikeout ability','Runners on base','Protect shutout'])
+                if st.button('🔁 BRING IN RELIEVER',disabled=not legal_change(g),use_container_width=True):
+                    bring_in(g,incoming,reason);st.rerun()
+            if not legal_change(g): st.caption('Three-batter minimum or end of half-inning.')
     with center:
-        st.markdown('### 🏟️ Live diamond');diamond(g)
-        st.write(f"**At bat:** {h['name']} ({h['bats']}) | **Pitcher:** {p['name']} ({throwing(p['throws'])})")
+        st.markdown('### 🏟️ Live stadium')
+        diamond(g)
+        st.markdown(f'''<div class="pitcher-card"><div class="label">CURRENT MATCHUP</div><div class="name">{escape(h['name'])} <span style="font-size:14px;color:#ffbd70">({escape(h['bats'])} BAT)</span></div><div class="stats">vs. {escape(p['name'])} • {throwing(p['throws'])} • Batter AVG {escape(str(h['stats'].get('avg','—')))}</div></div>''',unsafe_allow_html=True)
         if not g['finished']:
-            approach=st.radio('Pitch approach',['Balanced','Attack the zone','Pitch carefully'],horizontal=True)
-            defense=['Normal']
-            if g['bases'][0] and g['outs']<2:defense.append('Double-play depth')
-            if g['bases'][2] and g['outs']<2:defense.append('Infield in')
-            alignment=st.selectbox('Defense',defense)
-            if not all(g['bases']) and st.button('🚶 Intentional walk'):
-                intentional_walk(g);st.rerun()
-            if st.button('⚾ PITCH TO BATTER',type='primary',use_container_width=True):simulate(g,approach,alignment);st.rerun()
+            approach=st.radio('Pitch approach',['Balanced','Attack the zone','Pitch carefully'],horizontal=True,key='pitch_strategy')
+            defenses=['Normal']
+            if g['bases'][0] and g['outs']<2:defenses.append('Double-play depth')
+            if g['bases'][2] and g['outs']<2:defenses.append('Infield in')
+            defense=st.selectbox('Defense',defenses)
+            action1,action2=st.columns([2,1])
+            with action1:
+                if st.button('⚾ PITCH TO BATTER',type='primary',use_container_width=True):
+                    simulate(g,approach,defense);st.rerun()
+            with action2:
+                if st.button('🚶 INT. WALK',disabled=all(g['bases']),use_container_width=True):
+                    intentional_walk(g);st.rerun()
         else:
-            st.success('🏆 SHUTOUT!' if g['runs']==0 else f"Game over: {g['runs']} runs allowed")
-        st.info(g['last_play'])
-        for note in reversed(g['log'][-5:]):st.caption(note)
+            if g['runs']==0:st.success('🏆 SHUTOUT! 27 outs. Zero runs.')
+            else:st.info(f"GAME OVER • {g['runs']} runs allowed. Review your decisions below.")
+        with st.expander('📻 Radio booth • play-by-play',expanded=False):
+            for line in reversed(g['log'][-12:]):st.write(line)
     with right:
         st.markdown('### 🧢 Opposing lineup')
-        spot=g['spot']%9
-        lineup=[{'#':i+1,'Status':'🔴 AT BAT' if i==spot else '🟡 ON DECK' if i==(spot+1)%9 else '⚪ NEXT' if i==(spot+2)%9 else '', 'Batter':x['name'],'Bats':x['bats'],'AVG':x['stats'].get('avg','—')} for i,x in enumerate(g['lineup'])]
-        st.dataframe(pd.DataFrame(lineup),hide_index=True,use_container_width=True,height=265)
-        st.markdown('### 🧠 Situation room')
+        current=g['spot']%9
+        lineup=[]
+        for i,x in enumerate(g['lineup']):
+            label='🔴' if i==current else '🟡' if i==(current+1)%9 else '⚪' if i==(current+2)%9 else ''
+            lineup.append({'#':i+1,'':label,'Batter':x['name'],'Hand':x['bats'],'AVG':x['stats'].get('avg','—')})
+        st.dataframe(pd.DataFrame(lineup),hide_index=True,use_container_width=True,height=315)
+        st.caption('🔴 At bat  •  🟡 On deck  •  ⚪ In the hole')
         alert=danger(g)
         if alert:st.error(alert)
-        else:st.success('No immediate danger')
-        if alert and g['mode']!='Hall of Fame':
-            record=h2h(p['id'],h['id'],g['year'])
-            if record and record.get('atBats') is not None:
-                st.write(f"Verified H2H: {record.get('hits','—')} H / {record['atBats']} AB • AVG {record.get('avg','—')}")
-            else:st.caption('Verified player-vs-player statistics unavailable; not estimated.')
-        st.write(f"Batter AVG: **{h['stats'].get('avg','—')}** • Pitcher ERA: **{p['stats'].get('era','—')}**")
-        if not g['finished']:
-            st.markdown('#### 📊 Actual season handedness splits')
-            for pitcher_hand in ('L','R'):
-                record=observed_batting_split(h,pitcher_hand,g['year'])
-                label='LHP' if pitcher_hand=='L' else 'RHP'
-                if record:
-                    ab=int(number(record.get('atBats')))
-                    hits=int(number(record.get('hits')))
-                    st.write(f"**{h['name']} vs. {label}:** {hits}/{ab} • AVG {hits/ab:.3f}")
-                else:
-                    st.caption(f"{h['name']} vs. {label}: verified split unavailable")
-            pitching_record=observed_pitching_split(p,h['bats'],g['year'])
-            if pitching_record:
-                bf=int(number(pitching_record.get('battersFaced')))
-                st.caption(f"{p['name']} vs. {h['bats']}-handed batters: {bf} batters faced (season split)")
-            else:
-                st.caption('Pitcher handedness split unavailable; model uses season stats.')
-            st.caption('The simulator blends observed splits with season totals, weighting larger samples more heavily.')
-        if alert and g['mode']=='Rookie':st.info('Compare the relievers below, but remember: estimated probabilities are not guarantees.')
-    st.markdown('### 📊 Bullpen Matchup Lab')
-    st.caption('Estimated outcome rates against the NEXT THREE hitters. These are educational estimates informed by historical L/R season splits when available, NOT official probabilities. Lower risk proxy is preferable; it is not an actual chance of allowing a run.')
-    comparison=compare_pitchers(g)
-    table=pd.DataFrame(comparison).drop(columns=['ID'])
-    st.dataframe(table,hide_index=True,use_container_width=True)
-    upcoming=' → '.join(f"{x['name']} ({x['bats']})" for x in next_hitters(g))
-    st.write(f"**Coming up:** {upcoming}")
-    best=comparison[0]
-    if not g['finished']:
-        st.info(f"Model's lowest-risk option: **{best['Pitcher']}** ({best['Hand']}, {best['Status']}). Consider warmup time, three-batter minimum, and small differences before making a change.")
-    with st.expander('📋 Manager Report Card',expanded=g['finished']):
-        st.metric('Decision-process score (approximate)',f'{report_grade(g)}/100')
-        st.caption('Learning-oriented scoring rewards documented strategies, timely pitching changes, and changes with lower estimated matchup risk. It is not based solely on random game outcomes and is not a validated grade.')
+        elif not g['finished']:st.success('No immediate danger')
+        with st.expander('🔍 Scouting • current matchup',expanded=bool(alert)):
+            if alert and g['mode']!='Hall of Fame':
+                record=h2h(p['id'],h['id'],g['year'])
+                if record and record.get('atBats') is not None:
+                    st.write(f"Verified H2H: {record.get('hits','—')} hits in {record['atBats']} AB • AVG {record.get('avg','—')}")
+                else:st.caption('Verified batter–pitcher history unavailable.')
+            st.write(f"**Batter:** {h['name']} | AVG {h['stats'].get('avg','—')}")
+            st.write(f"**Pitcher:** {p['name']} | ERA {p['stats'].get('era','—')} | WHIP {p['stats'].get('whip','—')}")
+            if not g['finished']:
+                st.markdown('**Actual historical batter splits**')
+                for ph in ('L','R'):
+                    rec=observed_batting_split(h,ph,g['year'])
+                    if rec:
+                        ab=int(number(rec.get('atBats')));hits=int(number(rec.get('hits')))
+                        st.write(f"vs. {throwing(ph)}: **{hits}/{ab} (. {0 if ab==0 else hits/ab:.3f})**".replace('(. ', '('))
+                    else:st.caption(f"vs. {throwing(ph)}: unavailable")
+                st.caption('Historical splits feed the model when available; simulation rates are estimates.')
+    with st.expander('📊 BULLPEN MATCHUP LAB • next three hitters',expanded=bool(danger(g))):
+        st.caption('Modeled hit, walk and strikeout chances; NOT official MLB projections.')
+        comparisons=compare_pitchers(g)
+        if comparisons:
+            st.dataframe(pd.DataFrame(comparisons).drop(columns=['ID']),hide_index=True,use_container_width=True)
+            st.write('**Up next:** '+' → '.join(f"{x['name']} ({x['bats']})" for x in next_hitters(g)))
+            st.info(f"Lowest modeled risk: {comparisons[0]['Pitcher']} ({comparisons[0]['Status']}). Not a guaranteed result.")
+    with st.expander('🏆 MANAGER REPORT CARD',expanded=g['finished']):
+        st.metric('Decision-process score (illustrative)',f'{report_grade(g)}/100')
+        st.caption('Classroom heuristic based on documented reasoning and estimated matchup changes, not a validated measure of manager skill.')
         if g['decisions']:st.dataframe(pd.DataFrame(g['decisions']),hide_index=True,use_container_width=True)
         if g['strategy_log']:st.dataframe(pd.DataFrame(g['strategy_log']).tail(30),hide_index=True,use_container_width=True)
-        st.write(f"Runs allowed: {g['runs']} • Hits: {g['hits']} • Ks: {g['strikeouts']} • Double plays: {g['double_plays']} • Intentional walks: {g['intentional_walks']}")
+        st.write(f"Runs {g['runs']} • Hits {g['hits']} • Strikeouts {g['strikeouts']} • Double plays {g['double_plays']} • Intentional walks {g['intentional_walks']}")
         if g['finished']:
-            st.download_button('Download manager decisions CSV',pd.DataFrame(g['decisions']).to_csv(index=False),'manager_decisions.csv','text/csv')
-    if st.button('START NEW GAME'):
+            st.download_button('Export decisions (CSV)',pd.DataFrame(g['decisions']).to_csv(index=False),'manager_decisions.csv','text/csv')
+    if st.button('🔄 START NEW GAME'):
         st.session_state.game=None;st.session_state.loaded=None;st.rerun()
-st.caption('MLB Stats API season statistics and available L/R splits; playing situations and outcome probabilities are simulated. Rosters are season-level approximations, not actual single-game lineups.')
+st.caption('Season-level MLB data, with observed L/R splits where available. The lineup is an approximation, and all at-bat outcomes and decision-risk projections are simulated.')
