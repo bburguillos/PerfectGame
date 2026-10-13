@@ -2,6 +2,14 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html import escape
 import json
+from io import BytesIO
+from datetime import datetime, timezone
+from uuid import uuid4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.units import inch
 import pandas as pd
 import requests
 import streamlit as st
@@ -183,7 +191,9 @@ def starting_game(data, starter, mode):
       intentional_walks=0,last_play='Game begins!',play_result='',play_detail='',play_runs=0,
       prior_bases=[False]*3,play_serial=0,highlights=[],achievements=[],
       inning_start_runs=0,inning_reliever=False,jam_escaped=False,
-      relief_scoreless=0,relief_inning_outs=0)
+      relief_scoreless=0,relief_inning_outs=0,career_id=str(uuid4()),career_saved=False,
+      scouting=data.get('scouting',{}),confidence={x['id']:70 for x in staff},
+      mound_visits=5,visit_boost={x['id']:0 for x in staff},confidence_events=[])
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -198,6 +208,34 @@ def pitcher_limit(p, mode):
 
 
 def fatigue(g,p): return g['pitches'][p['id']]/pitcher_limit(p,g['mode'])
+def pitcher_confidence(g,p):
+    return g.get('confidence',{}).get(p['id'],70)
+
+
+def mound_visit(g):
+    if g['finished'] or g.get('mound_visits',0)<=0:
+        return False
+    p=pitcher(g)
+    g['mound_visits']-=1
+    before=pitcher_confidence(g,p)
+    g['confidence'][p['id']]=min(95,before+12)
+    g['visit_boost'][p['id']]=2
+    event=f"Mound visit to {p['name']} in inning {g['inning']}: confidence {before} to {g['confidence'][p['id']]}"
+    g['confidence_events'].append(event)
+    g['log'].append('🧢 '+event)
+    return True
+
+
+def update_confidence(g,p,result,runs):
+    adjustment={'strikes out':6,'grounds into a DOUBLE PLAY':9,
+       'walks':-6,'singles':-5,'DOUBLES':-9,'TRIPLES':-12,
+       'HOMERS':-16}.get(result,3)
+    adjustment-=min(12,runs*5)
+    pid=p['id']
+    g['confidence'][pid]=int(bounded(pitcher_confidence(g,p)+adjustment,15,95))
+    g['visit_boost'][pid]=max(0,g['visit_boost'].get(pid,0)-1)
+
+
 def legal_change(g): return not g['finished'] and (g['appearance']>=3 or g['inning']>g['entry_inning'])
 
 
@@ -263,6 +301,15 @@ def estimate(g,p,h,approach='Balanced',defense='Normal'):
     elif approach=='Pitch carefully': hp*=.88;wp*=1.70;kp*=.82
     if defense=='Infield in' and g['bases'][2] and g['outs']<2: hp*=1.13
     if defense=='Double-play depth' and g['bases'][0] and g['outs']<2: hp*=1.04
+    # Confidence is a clearly simulated effect, separate from workload fatigue.
+    confidence=pitcher_confidence(g,p) if p['id']==g['pitcher'] else 70
+    confidence_shift=(confidence-70)/100
+    hp*=1-.12*confidence_shift
+    wp*=1-.24*confidence_shift
+    kp*=1+.15*confidence_shift
+    if p['id']==g['pitcher'] and g.get('visit_boost',{}).get(p['id'],0)>0:
+        wp*=.88
+        hp*=.97
     hp=bounded(hp,.04,.58);wp=bounded(wp,.01,.32);kp=bounded(kp,.02,max(.02,1-hp-wp))
     return hp,wp,kp
 
@@ -401,6 +448,7 @@ def simulate(g,approach,defense):
         else:g['outs']+=1;result='is retired on a ball in play'
     pitches=random.randint(4,9) if approach=='Pitch carefully' else random.randint(2,6) if approach=='Attack the zone' else random.randint(3,8)
     g['pitches'][p['id']]+=pitches;g['faced'][p['id']]+=1;g['appearance']+=1
+    update_confidence(g,p,result,runs)
     g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT'}.get(result,'OUT')
     g['play_detail']=f"{h['name']} vs. {p['name']}";g['play_runs']=runs
     g['last_play']=f"Inning {g['inning']}: {h['name']} {result} vs. {p['name']} ({pitches} pitches)."+(f' {runs} run(s) score!' if runs else '')
@@ -503,11 +551,248 @@ def report_grade(g):
     return bounded(decision_score,0,100)
 
 
-st.title("⚾ YOU'RE THE MANAGER · SIDE-BY-SIDE STADIUM")
+
+# ==========================================
+# CAREER MODE AND PDF REPORT
+# ==========================================
+
+def clean_manager_name(name):
+    return (str(name).strip()[:45] or 'Manager')
+
+
+def grade_letter(score):
+    return 'A' if score >= 90 else 'B' if score >= 80 else 'C' if score >= 70 else 'D' if score >= 60 else 'F'
+
+
+def manager_assessment(g):
+    """Transparent classroom rubric: decisions matter more than simulated luck."""
+    changes = g.get('decisions', [])
+    actions = g.get('strategy_log', [])
+    total_pa = max(1, len(actions))
+    meaningful = sum(1 for a in actions if a.get('Approach') not in ('Balanced', None) or a.get('Defense') not in ('Normal', None, '—'))
+    # Strategy choices are evidence of active management, not automatically 'correct'.
+    engagement = min(20, round(16 * min(1, total_pa / 27) + 4 * min(1, meaningful / 6)))
+    # No bullpen change is not automatically a failure; baseline credit applies.
+    if changes:
+        good_matchups = sum(bool(x.get('Improved proxy')) for x in changes)
+        timely = sum(number(x.get('Fatigue at change')) <= 110 for x in changes)
+        bullpen = round(10 + 12 * good_matchups / len(changes) + 8 * timely / len(changes))
+    else:
+        bullpen = 24
+    bullpen = min(30, bullpen)
+    # Recognize reading the situation, without claiming to judge intent from a dropdown.
+    dangerous_actions = sum(1 for a in actions if a.get('Approach') in ('Pitch carefully', 'Attack the zone', 'Intentional walk') or a.get('Defense') in ('Infield in','Double-play depth'))
+    strategy = min(30, round(18 + 12 * min(1, dangerous_actions / 7)))
+    # Runs permitted carry only 20% of the final score.
+    outcome = max(0, 20 - min(20, int(g.get('runs',0)) * 3))
+    parts = {'Engagement': engagement, 'Bullpen decisions': bullpen,
+             'Situational strategy': strategy, 'Run prevention': outcome}
+    score = min(100, max(0, sum(parts.values())))
+    notes = []
+    if not changes:
+        notes.append('No pitching changes: the rubric awards baseline bullpen credit instead of assuming a mistake.')
+    elif any(x.get('Improved proxy') for x in changes):
+        notes.append('At least one pitching change improved the modelled matchup-risk index.')
+    else:
+        notes.append('Pitching changes did not lower the modelled matchup-risk index; discuss the reasons for those choices.')
+    if g.get('runs',0) == 0:
+        notes.append('Shutout achieved. Remember: a good decision can still lead to a hit, and luck matters.')
+    else:
+        notes.append('Runs allowed affect just 20% of the grade, so decisions matter more than random results.')
+    scout=g.get('scouting',{})
+    if scout:
+        threats=set(scout.get('threat_ids',[]))
+        top_three={x['id'] for x in sorted(g['lineup'],key=lambda x:(number(x['stats'].get('ops')),number(x['stats'].get('homeRuns'))),reverse=True)[:3]}
+        overlap=len(threats & top_three)
+        notes.append(f"Pregame scouting: {overlap} of 3 selected threats matched the top three lineup hitters by the selected statistical ranking. This is feedback, not a guarantee of game outcomes.")
+        notes.append(f"Pregame plan: {scout.get('plan','Not recorded')}. Mound visits used: {5-g.get('mound_visits',5)}.")
+    return {'score':score,'letter':grade_letter(score),'parts':parts,'notes':notes}
+
+
+def career_record(g, name):
+    assessment = manager_assessment(g)
+    return {
+        'id':g.get('career_id') or str(uuid4()),
+        'date_utc':datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+        'manager':clean_manager_name(name), 'season':int(g['year']),
+        'team':str(g['team']), 'opponent':str(g['opponent']),
+        'difficulty':str(g['mode']), 'runs':int(g['runs']),
+        'hits':int(g['hits']), 'strikeouts':int(g['strikeouts']),
+        'shutout':g['runs']==0,
+        'grade':assessment['score'], 'letter':assessment['letter'],
+        'rubric':assessment['parts'],
+        'achievements':list(g.get('achievements',[])),
+        'pitching_changes':len(g.get('decisions',[])),
+        'strategies':len(g.get('strategy_log',[])),
+        'scouting':g.get('scouting',{}),'mound_visits_used':5-g.get('mound_visits',5)
+    }
+
+
+def career_stats(records):
+    if not records:
+        return {'Games':0,'Shutouts':0,'Avg grade':'—','Best grade':'—'}
+    return {'Games':len(records),
+            'Shutouts':sum(bool(x.get('shutout')) for x in records),
+            'Avg grade':f"{sum(int(x.get('grade',0)) for x in records)/len(records):.1f}",
+            'Best grade':max(int(x.get('grade',0)) for x in records)}
+
+
+def pdf_escape(value):
+    return escape(str(value))
+
+
+def make_game_pdf(g, name):
+    assessment = manager_assessment(g)
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf,pagesize=(612,792),rightMargin=38,leftMargin=38,
+                            topMargin=38,bottomMargin=38)
+    styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name='Brand',parent=styles['Heading1'],fontName='Helvetica-Bold',
+                              fontSize=19,leading=23,textColor=colors.HexColor('#E67727'),spaceAfter=5))
+    styles.add(ParagraphStyle(name='SmallCustom',parent=styles['Normal'],fontSize=9,leading=13,spaceAfter=6))
+    styles.add(ParagraphStyle(name='SubtitleCustom',parent=styles['Heading2'],fontSize=12,
+                              textColor=colors.HexColor('#14374A'),spaceBefore=10,spaceAfter=7))
+    story=[Paragraph('SPORTS BY THE NUMBERS | MANAGER REPORT',styles['Brand']),
+           Paragraph(f"Manager: <b>{pdf_escape(clean_manager_name(name))}</b>  |  "
+                     f"Game: <b>{pdf_escape(g['year'])} {pdf_escape(g['team'])} vs. {pdf_escape(g['opponent'])}</b>  |  "
+                     f"Mode: {pdf_escape(g['mode'])}",styles['SmallCustom']),
+           Spacer(1,8)]
+    header=Table([[f"{assessment['score']}/100", f"GRADE {assessment['letter']}",
+                   'SHUTOUT' if g['runs']==0 else f"{g['runs']} RUNS ALLOWED"]],
+                 colWidths=[170,170,170],rowHeights=[44])
+    header.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,-1),colors.HexColor('#14374A')),
+                                ('TEXTCOLOR',(0,0),(-1,-1),colors.white),
+                                ('FONTNAME',(0,0),(-1,-1),'Helvetica-Bold'),
+                                ('FONTSIZE',(0,0),(-1,-1),14),
+                                ('ALIGN',(0,0),(-1,-1),'CENTER'),
+                                ('VALIGN',(0,0),(-1,-1),'MIDDLE')]))
+    story += [header,Spacer(1,12),Paragraph('How the grade was calculated',styles['SubtitleCustom'])]
+    rubric=[['Category','Points earned','Maximum']]
+    for k,v in assessment['parts'].items():
+        rubric.append([k,str(v),str({'Engagement':20,'Bullpen decisions':30,
+                                     'Situational strategy':30,'Run prevention':20}[k])])
+    t=Table(rubric,colWidths=[280,115,115],hAlign='LEFT')
+    t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E7EEF2')),
+                           ('GRID',(0,0),(-1,-1),.35,colors.HexColor('#B3C5CC')),
+                           ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
+                           ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#F8FAFB')]),
+                           ('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6)]))
+    story += [t,Spacer(1,8)]
+    for note in assessment['notes']:
+        story.append(Paragraph('• '+pdf_escape(note),styles['SmallCustom']))
+    scout=g.get('scouting',{})
+    if scout:
+        story.append(Paragraph('Pregame scouting plan',styles['SubtitleCustom']))
+        story.append(Paragraph('Plan: '+pdf_escape(scout.get('plan','Not recorded')),styles['SmallCustom']))
+        names={p['id']:p['name'] for p in g['lineup']}
+        selected=', '.join(names.get(pid,str(pid)) for pid in scout.get('threat_ids',[]))
+        story.append(Paragraph('Selected threats: '+pdf_escape(selected),styles['SmallCustom']))
+        story.append(Paragraph('Starter rationale: '+pdf_escape(scout.get('rationale','')),styles['SmallCustom']))
+        story.append(Paragraph(f"Mound visits used: {5-g.get('mound_visits',5)}",styles['SmallCustom']))
+    story += [Paragraph('Game statistics',styles['SubtitleCustom']),
+              Paragraph(f"Hits allowed: <b>{g['hits']}</b> | Strikeouts: <b>{g['strikeouts']}</b> | "
+                        f"Double plays: <b>{g['double_plays']}</b> | Intentional walks: <b>{g['intentional_walks']}</b> | "
+                        f"Pitching changes: <b>{len(g['decisions'])}</b>",styles['SmallCustom'])]
+    if g['achievements']:
+        story.append(Paragraph('Achievements: '+pdf_escape(', '.join(g['achievements'])),styles['SmallCustom']))
+    story.append(Paragraph('Evidence from managerial decisions',styles['SubtitleCustom']))
+    if g['decisions']:
+        for decision in g['decisions'][:7]:
+            story.append(Paragraph(
+                f"Inning {pdf_escape(decision.get('Inning','?'))}: "
+                f"{pdf_escape(decision.get('Out','?'))} to {pdf_escape(decision.get('In','?'))}. "
+                f"Reason: {pdf_escape(decision.get('Reason','—'))}. "
+                f"Modelled risk index: {pdf_escape(decision.get('Old risk','—'))} to "
+                f"{pdf_escape(decision.get('New risk','—'))}.",styles['SmallCustom']))
+    else:
+        story.append(Paragraph('No pitching substitutions were made.',styles['SmallCustom']))
+    story.append(Paragraph('Major plays',styles['SubtitleCustom']))
+    for highlight in g.get('highlights',[])[-4:]:
+        story.append(Paragraph('• '+pdf_escape(highlight),styles['SmallCustom']))
+    story += [Paragraph('Student reflection (complete after the game)',styles['SubtitleCustom'])]
+    for q in ['1. Which managerial decision mattered most? Explain using at least two statistics.',
+              '2. Did you make a good decision that produced an unlucky outcome? Explain.',
+              '3. What would you change in your next game?']:
+        story.append(Paragraph(pdf_escape(q),styles['SmallCustom']))
+        story.append(Paragraph('_'*96,styles['SmallCustom']))
+    story.append(Spacer(1,5))
+    story.append(Paragraph('This is an instructional rubric, not a validated estimate of MLB managerial skill. '
+                           'Historical player statistics inform an educational simulation; outcomes and risk indices are modelled.',
+                           styles['SmallCustom']))
+    doc.build(story)
+    return buf.getvalue()
+
+
+def safe_career_import(raw):
+    data=json.loads(raw)
+    if not isinstance(data,dict) or data.get('format')!='sbtn-career-v1':
+        raise ValueError("This is not a compatible career file.")
+    records=data.get('games',[])
+    if not isinstance(records,list) or len(records)>2000:
+        raise ValueError('Invalid game history.')
+    cleaned=[]
+    for record in records:
+        if not isinstance(record,dict) or not record.get('id'):
+            continue
+        cleaned.append({k:v for k,v in record.items() if k in {
+            'id','date_utc','manager','season','team','opponent','difficulty',
+            'runs','hits','strikeouts','shutout','grade','letter','rubric',
+            'achievements','pitching_changes','strategies'}})
+    return clean_manager_name(data.get('manager','Manager')),cleaned
+
+
+st.title("⚾ YOU'RE THE MANAGER · CAREER STADIUM")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
 if 'selected_relief_id' not in st.session_state: st.session_state.selected_relief_id=None
+if 'career_games' not in st.session_state: st.session_state.career_games=[]
+if 'career_name' not in st.session_state: st.session_state.career_name='Manager'
+
+# Record completed games once, even on Streamlit reruns.
+active_game=st.session_state.game
+if active_game and active_game.get('finished') and not active_game.get('career_saved',False):
+    record=career_record(active_game,st.session_state.career_name)
+    ids={x.get('id') for x in st.session_state.career_games}
+    if record['id'] not in ids:
+        st.session_state.career_games.append(record)
+    active_game['career_saved']=True
+
+with st.expander('🏆 CAREER MANAGER • Profile, history, and backups',expanded=st.session_state.game is None):
+    st.text_input('Manager name / student identifier',key='career_name',max_chars=45,
+                  help='Avoid full student names if career files will be shared.')
+    summary=career_stats(st.session_state.career_games)
+    mini=st.columns(4)
+    for col,(label,value) in zip(mini,summary.items()):col.metric(label,value)
+    if st.session_state.career_games:
+        st.dataframe(pd.DataFrame(st.session_state.career_games)[
+            ['date_utc','season','team','opponent','difficulty','runs','grade','letter','shutout']
+        ],hide_index=True,use_container_width=True,height=200)
+    career_payload={'format':'sbtn-career-v1','manager':clean_manager_name(st.session_state.career_name),
+                    'games':st.session_state.career_games}
+    st.download_button('💾 SAVE CAREER FILE (JSON)',
+        data=json.dumps(career_payload,indent=2),file_name='manager_career.json',
+        mime='application/json',key='download_career')
+    uploaded=st.file_uploader('Load a previously saved career file',type=['json'],key='career_upload')
+    if uploaded is not None and st.button('📂 IMPORT / MERGE CAREER',key='import_career'):
+        try:
+            imported_name,imported_records=safe_career_import(uploaded.getvalue().decode('utf-8'))
+            existing={x.get('id') for x in st.session_state.career_games}
+            count=0
+            for item in imported_records:
+                if item['id'] not in existing:
+                    st.session_state.career_games.append(item)
+                    existing.add(item['id'])
+                    count+=1
+            # Keep the current manager name; it can be edited in the profile field.
+            st.success(f'Imported {count} previously unrecorded games.')
+            st.rerun()
+        except (ValueError,UnicodeError,TypeError,KeyError) as error:
+            st.error(f'Career import failed: {error}')
+    st.caption('Career progress lives in this browser session until you export it. '
+               'For future visits or different devices, download the JSON and import it next time. '
+               'Streamlit Community Cloud does not guarantee persistent local storage.')
+
 
 with st.expander('⚙️ NEW GAME • Season & matchup', expanded=st.session_state.game is None):
     year=st.selectbox('Season',list(range(2025,1999,-1)))
@@ -544,7 +829,27 @@ if loaded and st.session_state.game is None:
     s1,s2=st.columns(2)
     starter=s1.selectbox('Choose your starting pitcher',list(by_id),format_func=lambda pid:f"{by_id[pid]['name']} • {throwing(by_id[pid]['throws'])} • ERA {by_id[pid]['stats'].get('era','—')}")
     difficulty=s2.selectbox('Difficulty',['Rookie','Pro','Hall of Fame'])
-    if st.button('⚾ PLAY BALL!',type='primary'):
+    st.markdown('#### 🕵️ Pregame Scouting Room')
+    st.caption('Rankings use real season statistics. Predictions and managerial tactics remain your choices.')
+    scout_hitters=loaded['hitters'][:9]
+    scout_rows=[]
+    for player_obj in scout_hitters:
+        stats=player_obj['stats']
+        scout_rows.append({'Hitter':player_obj['name'],'Bats':player_obj['bats'],
+          'AVG':stats.get('avg','—'),'OBP':stats.get('obp','—'),
+          'OPS':stats.get('ops','—'),'HR':int(number(stats.get('homeRuns')))})
+    st.dataframe(pd.DataFrame(scout_rows),hide_index=True,use_container_width=True,height=235)
+    ids={x['id']:x for x in scout_hitters}
+    threats=st.multiselect('Pick the THREE hitters most dangerous to your shutout',
+       options=list(ids),max_selections=3,format_func=lambda pid:ids[pid]['name'])
+    plan=st.selectbox('Pregame strategy',[
+       'Attack hitters early', 'Pitch carefully to power hitters',
+       'Lean on ground-ball defense', 'Prepare the bullpen early'])
+    rationale=st.text_input('Why did you choose this starter? (one statistical reason)',
+       max_chars=180,placeholder='Example: Low WHIP and strong strikeout rate')
+    if st.button('⚾ PLAY BALL!',type='primary',disabled=len(threats)!=3 or not rationale.strip()):
+        loaded['scouting']={'threat_ids':threats,'plan':plan,'rationale':rationale.strip(),
+                           'starter_id':starter}
         st.session_state.game=starting_game(loaded,starter,difficulty)
         st.session_state.selected_relief_id=None
         st.rerun()
@@ -575,6 +880,15 @@ if g:
         st.markdown(f"**{escape(p['name'])}** · {throwing(p['throws'])} · {p['role']}")
         st.caption(f"ON MOUND · ERA {p['stats'].get('era','—')} · WHIP {p['stats'].get('whip','—')}")
         st.progress(bounded(fatigue(g,p),0,1),text=f"Fatigue {fatigue(g,p):.0%}")
+        st.progress(pitcher_confidence(g,p)/100,text=f"Confidence {pitcher_confidence(g,p)} / 100 (simulated)")
+        if not g['finished']:
+            if st.button(f"🧢 MOUND VISIT · {g.get('mound_visits',5)} left",key='side_mound_visit',
+                         use_container_width=True,disabled=g.get('mound_visits',0)<=0):
+                mound_visit(g)
+                st.rerun()
+            if g.get('visit_boost',{}).get(p['id'],0):
+                st.caption('Visit boost active: reduced modeled hit/walk risk for the next 2 batters')
+
         if available and not g['finished']:
             st.caption('Tap a pitcher to scout or manage')
             # Exactly four immediately visible compact card buttons; additional pitchers via selectbox.
@@ -684,7 +998,11 @@ if g:
                 st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
             st.caption('Lower risk proxy is better in this educational model; it is not probability of runs.')
     with report_tab:
-        st.metric('Decision-process score (illustrative)',f"{report_grade(g)}/100")
+        assessment=manager_assessment(g)
+        st.metric('MANAGER GRADE',f"{assessment['letter']} · {assessment['score']}/100")
+        st.caption('Rubric: engagement 20, bullpen decisions 30, situational strategy 30, run prevention 20. Outcomes have only 20% weight.')
+        st.dataframe(pd.DataFrame([{'Category':k,'Points':v} for k,v in assessment['parts'].items()]),hide_index=True,use_container_width=True)
+        for note in assessment['notes']:st.caption('• '+note)
         for achievement in g['achievements']:st.success('🏅 '+achievement)
         if g['highlights']:
             st.markdown('#### Broadcast highlights')
@@ -693,6 +1011,11 @@ if g:
         if g['strategy_log']:st.dataframe(pd.DataFrame(g['strategy_log']).tail(30),hide_index=True,use_container_width=True)
         st.caption('Educational grading heuristic, not an objective measure of management skill.')
         if g['finished']:
+            st.download_button('📄 DOWNLOAD POSTGAME PDF + GRADE',
+                data=make_game_pdf(g,st.session_state.career_name),
+                file_name=f"manager_report_{g['year']}_{g['career_id'][:8]}.pdf",
+                mime='application/pdf',key='game_pdf')
+            st.caption('Your completed game is added to the career summary automatically. Save the career JSON above to keep it across visits.')
             st.download_button('Export pitching decisions',pd.DataFrame(g['decisions']).to_csv(index=False),'manager_decisions.csv','text/csv')
     if st.button('🔄 START NEW GAME'):
         st.session_state.game=None
@@ -700,979 +1023,3 @@ if g:
         st.session_state.selected_relief_id=None
         st.rerun()
 st.caption('Real MLB historical season statistics; game results, stamina and matchup projections are simulated.')
-
-# ==============================================
-# CAREER MANAGER + POSTGAME PDF EXTENSION
-# Paste this at the VERY END of your app.py
-# ==============================================
-
-import json
-from io import BytesIO
-from datetime import datetime, timezone
-from uuid import uuid4
-
-from reportlab.platypus import (
-    SimpleDocTemplate,
-    Paragraph,
-    Spacer,
-    Table,
-    TableStyle,
-    KeepTogether
-)
-from reportlab.lib import colors
-from reportlab.lib.styles import (
-    getSampleStyleSheet,
-    ParagraphStyle
-)
-from reportlab.lib.enums import TA_CENTER
-from xml.sax.saxutils import escape as pdf_escape
-
-
-# ==============================================
-# CAREER STORAGE
-# ==============================================
-
-if "career_games" not in st.session_state:
-    st.session_state.career_games = []
-
-if "career_manager_name" not in st.session_state:
-    st.session_state.career_manager_name = "Manager"
-
-
-def career_letter(score):
-    if score >= 90:
-        return "A"
-    elif score >= 80:
-        return "B"
-    elif score >= 70:
-        return "C"
-    elif score >= 60:
-        return "D"
-    return "F"
-
-
-# ==============================================
-# MANAGER GRADING RUBRIC
-# ==============================================
-
-def career_assessment(game):
-    """
-    100-point educational rubric.
-
-    Engagement: 20 points
-    Bullpen decisions: 30 points
-    Situational strategy: 30 points
-    Run prevention: 20 points
-
-    Performance is partly luck-dependent.
-    This grade is a classroom teaching tool.
-    """
-
-    changes = game.get("decisions", [])
-    strategies = game.get("strategy_log", [])
-
-    # ENGAGEMENT: 20 POINTS
-
-    plate_appearances = len(strategies)
-
-    participation = min(
-        1.0,
-        plate_appearances / 27
-    )
-
-    strategic_choices = sum(
-        1 for action in strategies
-        if (
-            action.get("Approach") not in (
-                "Balanced", None
-            )
-            or action.get("Defense") not in (
-                "Normal", None, "—"
-            )
-        )
-    )
-
-    engagement = min(
-        20,
-        round(
-            16 * participation
-            + 4 * min(
-                1.0, strategic_choices / 6
-            )
-        )
-    )
-
-    # BULLPEN DECISIONS: 30 POINTS
-    # Keeping an effective starter in is not
-    # automatically a bad decision.
-
-    if changes:
-        better_matchups = sum(
-            1 for change in changes
-            if change.get("Improved proxy", False)
-        )
-
-        timely_changes = sum(
-            1 for change in changes
-            if number(
-                change.get("Fatigue at change"),
-                150
-            ) <= 110
-        )
-
-        bullpen = round(
-            10
-            + 12 * better_matchups / len(changes)
-            + 8 * timely_changes / len(changes)
-        )
-    else:
-        bullpen = 24
-
-    bullpen = min(30, bullpen)
-
-    # SITUATIONAL STRATEGY: 30 POINTS
-
-    involved_decisions = sum(
-        1 for action in strategies
-        if (
-            action.get("Approach") in (
-                "Pitch carefully",
-                "Attack the zone",
-                "Intentional walk"
-            )
-            or action.get("Defense") in (
-                "Infield in",
-                "Double-play depth"
-            )
-        )
-    )
-
-    strategy = min(
-        30,
-        round(
-            18
-            + 12 * min(
-                1.0,
-                involved_decisions / 7
-            )
-        )
-    )
-
-    # RUN PREVENTION: 20 POINTS
-
-    runs = int(game.get("runs", 0))
-
-    run_prevention = max(
-        0,
-        20 - min(20, runs * 3)
-    )
-
-    categories = {
-        "Engagement": engagement,
-        "Bullpen decisions": bullpen,
-        "Situational strategy": strategy,
-        "Run prevention": run_prevention
-    }
-
-    score = max(
-        0,
-        min(100, sum(categories.values()))
-    )
-
-    comments = []
-
-    if changes:
-        good = sum(
-            bool(c.get("Improved proxy"))
-            for c in changes
-        )
-
-        comments.append(
-            f"{good} of {len(changes)} pitching "
-            "changes lowered the estimated "
-            "matchup-risk index."
-        )
-    else:
-        comments.append(
-            "No pitching changes were made. "
-            "That is not automatically a mistake."
-        )
-
-    comments.append(
-        f"You made {len(strategies)} recorded "
-        "plate-appearance strategy decisions."
-    )
-
-    if runs == 0:
-        comments.append(
-            "Shutout achieved! You completed "
-            "nine scoreless innings."
-        )
-    else:
-        comments.append(
-            "Runs allowed represent only 20% "
-            "of the grade because simulation "
-            "outcomes also involve luck."
-        )
-
-    return {
-        "score": score,
-        "letter": career_letter(score),
-        "categories": categories,
-        "comments": comments
-    }
-
-
-# ==============================================
-# SAVE A COMPLETED GAME
-# ==============================================
-
-def career_game_record(game, manager):
-    result = career_assessment(game)
-
-    return {
-        "id": game["career_id"],
-        "date": datetime.now(
-            timezone.utc
-        ).strftime("%Y-%m-%d %H:%M UTC"),
-        "manager": manager,
-        "season": game["year"],
-        "team": game["team"],
-        "opponent": game["opponent"],
-        "difficulty": game["mode"],
-        "runs": game["runs"],
-        "hits": game["hits"],
-        "strikeouts": game["strikeouts"],
-        "shutout": game["runs"] == 0,
-        "grade": result["score"],
-        "letter": result["letter"],
-        "achievements": list(
-            game.get("achievements", [])
-        ),
-        "pitching_changes": len(
-            game.get("decisions", [])
-        )
-    }
-
-
-def record_completed_career_game(game):
-    if game is None:
-        return
-
-    if not game.get("finished"):
-        return
-
-    if "career_id" not in game:
-        game["career_id"] = str(uuid4())
-
-    existing = {
-        record["id"]
-        for record in st.session_state.career_games
-    }
-
-    if game["career_id"] in existing:
-        return
-
-    record = career_game_record(
-        game,
-        st.session_state.career_manager_name
-    )
-
-    st.session_state.career_games.append(record)
-
-
-# ==============================================
-# GENERATE POSTGAME PDF
-# ==============================================
-
-def build_career_pdf(game, manager):
-    assessment = career_assessment(game)
-
-    output = BytesIO()
-
-    doc = SimpleDocTemplate(
-        output,
-        pagesize=(612, 792),
-        rightMargin=42,
-        leftMargin=42,
-        topMargin=36,
-        bottomMargin=36
-    )
-
-    styles = getSampleStyleSheet()
-
-    styles.add(
-        ParagraphStyle(
-            name="ManagerTitle",
-            parent=styles["Heading1"],
-            fontSize=19,
-            leading=23,
-            textColor=colors.HexColor(
-                "#E77826"
-            ),
-            spaceAfter=12
-        )
-    )
-
-    styles.add(
-        ParagraphStyle(
-            name="ManagerSection",
-            parent=styles["Heading2"],
-            fontSize=12,
-            leading=15,
-            textColor=colors.HexColor(
-                "#16394A"
-            ),
-            spaceBefore=12,
-            spaceAfter=7
-        )
-    )
-
-    styles.add(
-        ParagraphStyle(
-            name="ManagerBody",
-            parent=styles["Normal"],
-            fontSize=9,
-            leading=13,
-            spaceAfter=7
-        )
-    )
-
-    story = []
-
-    story.append(
-        Paragraph(
-            "SPORTS BY THE NUMBERS",
-            styles["ManagerTitle"]
-        )
-    )
-
-    story.append(
-        Paragraph(
-            "<b>YOU'RE THE MANAGER</b>"
-            " | OFFICIAL POSTGAME REPORT",
-            styles["ManagerSection"]
-        )
-    )
-
-    story.append(
-        Paragraph(
-            f"<b>Manager:</b> "
-            f"{pdf_escape(manager)}",
-            styles["ManagerBody"]
-        )
-    )
-
-    story.append(
-        Paragraph(
-            f"<b>Matchup:</b> "
-            f"{pdf_escape(str(game['year']))} "
-            f"{pdf_escape(game['team'])} "
-            f"vs. {pdf_escape(game['opponent'])}",
-            styles["ManagerBody"]
-        )
-    )
-
-    story.append(
-        Paragraph(
-            f"<b>Difficulty:</b> "
-            f"{pdf_escape(game['mode'])}",
-            styles["ManagerBody"]
-        )
-    )
-
-    story.append(Spacer(1, 10))
-
-    # LARGE GRADE BANNER
-
-    grade_table = Table(
-        [[
-            f"{assessment['score']}/100",
-            f"GRADE {assessment['letter']}",
-            (
-                "SHUTOUT!"
-                if game["runs"] == 0
-                else f"{game['runs']} RUNS ALLOWED"
-            )
-        ]],
-        colWidths=[170, 170, 170],
-        rowHeights=[48]
-    )
-
-    grade_table.setStyle(
-        TableStyle([
-            (
-                "BACKGROUND",
-                (0, 0), (-1, -1),
-                colors.HexColor("#15364B")
-            ),
-            (
-                "TEXTCOLOR",
-                (0, 0), (-1, -1),
-                colors.white
-            ),
-            (
-                "FONTNAME",
-                (0, 0), (-1, -1),
-                "Helvetica-Bold"
-            ),
-            (
-                "FONTSIZE",
-                (0, 0), (-1, -1),
-                14
-            ),
-            (
-                "ALIGN",
-                (0, 0), (-1, -1),
-                "CENTER"
-            ),
-            (
-                "VALIGN",
-                (0, 0), (-1, -1),
-                "MIDDLE"
-            )
-        ])
-    )
-
-    story.append(grade_table)
-
-    # SCORING BREAKDOWN
-
-    story.append(
-        Paragraph(
-            "MANAGER GRADING RUBRIC",
-            styles["ManagerSection"]
-        )
-    )
-
-    maximums = {
-        "Engagement": 20,
-        "Bullpen decisions": 30,
-        "Situational strategy": 30,
-        "Run prevention": 20
-    }
-
-    rubric_rows = [[
-        "Category",
-        "Points Earned",
-        "Maximum"
-    ]]
-
-    for category, earned in (
-        assessment["categories"].items()
-    ):
-        rubric_rows.append([
-            category,
-            str(earned),
-            str(maximums[category])
-        ])
-
-    rubric_table = Table(
-        rubric_rows,
-        colWidths=[270, 120, 120]
-    )
-
-    rubric_table.setStyle(
-        TableStyle([
-            (
-                "BACKGROUND",
-                (0, 0), (-1, 0),
-                colors.HexColor("#E5EDF2")
-            ),
-            (
-                "GRID",
-                (0, 0), (-1, -1),
-                0.4,
-                colors.HexColor("#BBCAD1")
-            ),
-            (
-                "FONTNAME",
-                (0, 0), (-1, 0),
-                "Helvetica-Bold"
-            ),
-            (
-                "FONTSIZE",
-                (0, 0), (-1, -1),
-                9
-            ),
-            (
-                "TOPPADDING",
-                (0, 0), (-1, -1),
-                7
-            ),
-            (
-                "BOTTOMPADDING",
-                (0, 0), (-1, -1),
-                7
-            )
-        ])
-    )
-
-    story.append(rubric_table)
-
-    # GAME STATISTICS
-
-    story.append(
-        Paragraph(
-            "GAME STATISTICS",
-            styles["ManagerSection"]
-        )
-    )
-
-    stats_text = (
-        f"<b>Runs:</b> {game['runs']} | "
-        f"<b>Hits:</b> {game['hits']} | "
-        f"<b>Strikeouts:</b> "
-        f"{game['strikeouts']} | "
-        f"<b>Double Plays:</b> "
-        f"{game['double_plays']} | "
-        f"<b>Pitching Changes:</b> "
-        f"{len(game['decisions'])}"
-    )
-
-    story.append(
-        Paragraph(
-            stats_text,
-            styles["ManagerBody"]
-        )
-    )
-
-    # GRADE COMMENTS
-
-    story.append(
-        Paragraph(
-            "MANAGER FEEDBACK",
-            styles["ManagerSection"]
-        )
-    )
-
-    for comment in assessment["comments"]:
-        story.append(
-            Paragraph(
-                pdf_escape(comment),
-                styles["ManagerBody"]
-            )
-        )
-
-    # PITCHING CHANGES
-
-    story.append(
-        Paragraph(
-            "IMPORTANT PITCHING DECISIONS",
-            styles["ManagerSection"]
-        )
-    )
-
-    if game.get("decisions"):
-        for change in game["decisions"][:8]:
-            description = (
-                f"Inning "
-                f"{change.get('Inning', '?')}: "
-                f"{change.get('Out', '?')} "
-                f"replaced by "
-                f"{change.get('In', '?')}. "
-                f"Reason: "
-                f"{change.get('Reason', '—')}. "
-                f"Risk index: "
-                f"{change.get('Old risk', '—')} "
-                f"to "
-                f"{change.get('New risk', '—')}."
-            )
-
-            story.append(
-                Paragraph(
-                    pdf_escape(description),
-                    styles["ManagerBody"]
-                )
-            )
-    else:
-        story.append(
-            Paragraph(
-                "No pitching substitutions "
-                "were made.",
-                styles["ManagerBody"]
-            )
-        )
-
-    # ACHIEVEMENTS
-
-    achievements = game.get(
-        "achievements", []
-    )
-
-    if achievements:
-        story.append(
-            Paragraph(
-                "ACHIEVEMENTS",
-                styles["ManagerSection"]
-            )
-        )
-
-        for achievement in achievements:
-            story.append(
-                Paragraph(
-                    pdf_escape(achievement),
-                    styles["ManagerBody"]
-                )
-            )
-
-    # STUDENT REFLECTION
-
-    story.append(
-        Paragraph(
-            "STUDENT REFLECTION",
-            styles["ManagerSection"]
-        )
-    )
-
-    questions = [
-        (
-            "1. Which managerial decision "
-            "was most important? Support "
-            "your answer with two statistics."
-        ),
-        (
-            "2. Describe one decision that "
-            "was statistically reasonable, "
-            "even if the outcome was unlucky."
-        ),
-        (
-            "3. What would you change "
-            "about your strategy next time?"
-        )
-    ]
-
-    for question in questions:
-        story.append(
-            Paragraph(
-                pdf_escape(question),
-                styles["ManagerBody"]
-            )
-        )
-
-        story.append(
-            Paragraph(
-                "_" * 86,
-                styles["ManagerBody"]
-            )
-        )
-
-    story.append(Spacer(1, 10))
-
-    story.append(
-        Paragraph(
-            "This report uses a classroom "
-            "assessment model. Historical MLB "
-            "statistics inform simulated outcomes. "
-            "Manager grades are not official "
-            "evaluations of baseball strategy.",
-            styles["ManagerBody"]
-        )
-    )
-
-    doc.build(story)
-
-    return output.getvalue()
-
-
-# ==============================================
-# CAREER MANAGEMENT SCREEN
-# ==============================================
-
-st.divider()
-
-st.markdown(
-    "## 🏆 CAREER MANAGER MODE"
-)
-
-st.caption(
-    "Your career tracks completed games, "
-    "shutouts, achievements, and manager grades."
-)
-
-st.text_input(
-    "Manager name or student ID",
-    key="career_manager_name",
-    max_chars=45,
-    help=(
-        "For classroom use, consider student "
-        "IDs instead of full names."
-    )
-)
-
-# Save finished game just once.
-current_game = st.session_state.get("game")
-
-if current_game is not None:
-    if "career_id" not in current_game:
-        current_game["career_id"] = str(uuid4())
-
-    record_completed_career_game(
-        current_game
-    )
-
-career = st.session_state.career_games
-
-# CAREER STATS
-
-games_played = len(career)
-
-shutouts = sum(
-    1 for game_record in career
-    if game_record.get("shutout")
-)
-
-average_grade = (
-    sum(
-        game_record.get("grade", 0)
-        for game_record in career
-    ) / games_played
-    if games_played else 0
-)
-
-best_grade = max(
-    (
-        game_record.get("grade", 0)
-        for game_record in career
-    ),
-    default=0
-)
-
-career_col1, career_col2, career_col3, career_col4 = (
-    st.columns(4)
-)
-
-career_col1.metric(
-    "Games Managed",
-    games_played
-)
-
-career_col2.metric(
-    "Career Shutouts",
-    shutouts
-)
-
-career_col3.metric(
-    "Average Grade",
-    f"{average_grade:.1f}"
-    if games_played else "—"
-)
-
-career_col4.metric(
-    "Best Grade",
-    best_grade if games_played else "—"
-)
-
-# CAREER HISTORY
-
-if career:
-    with st.expander(
-        "📋 View Career History"
-    ):
-        career_table = pd.DataFrame(career)
-
-        columns = [
-            "date",
-            "season",
-            "team",
-            "opponent",
-            "difficulty",
-            "runs",
-            "grade",
-            "letter",
-            "shutout"
-        ]
-
-        st.dataframe(
-            career_table[columns],
-            hide_index=True,
-            use_container_width=True
-        )
-
-# ==============================================
-# CAREER EXPORT / IMPORT
-# ==============================================
-
-career_data = {
-    "format": "sports-by-the-numbers-career-v1",
-    "manager": (
-        st.session_state.career_manager_name
-    ),
-    "games": career
-}
-
-st.download_button(
-    "💾 SAVE CAREER PROGRESS",
-    data=json.dumps(
-        career_data,
-        indent=2
-    ),
-    file_name="manager_career.json",
-    mime="application/json",
-    key="career_export_button"
-)
-
-with st.expander(
-    "📂 Restore a Saved Career"
-):
-    career_upload = st.file_uploader(
-        "Upload your previously saved career JSON",
-        type=["json"],
-        key="career_import_upload"
-    )
-
-    if (
-        career_upload is not None
-        and st.button(
-            "IMPORT CAREER",
-            key="career_import_button"
-        )
-    ):
-        try:
-            imported = json.loads(
-                career_upload.getvalue().decode(
-                    "utf-8"
-                )
-            )
-
-            if (
-                not isinstance(imported, dict)
-                or imported.get("format")
-                != "sports-by-the-numbers-career-v1"
-            ):
-                raise ValueError(
-                    "Invalid career file format."
-                )
-
-            records = imported.get(
-                "games", []
-            )
-
-            if (
-                not isinstance(records, list)
-                or len(records) > 2000
-            ):
-                raise ValueError(
-                    "Invalid career history."
-                )
-
-            known_ids = {
-                item.get("id")
-                for item in st.session_state.career_games
-            }
-
-            imported_count = 0
-
-            for record in records:
-                if not isinstance(record, dict):
-                    continue
-
-                if not record.get("id"):
-                    continue
-
-                if record["id"] in known_ids:
-                    continue
-
-                if not isinstance(
-                    record.get("grade"), (int, float)
-                ):
-                    continue
-
-                st.session_state.career_games.append(
-                    record
-                )
-
-                known_ids.add(record["id"])
-                imported_count += 1
-
-            st.success(
-                f"Imported {imported_count} "
-                "career games."
-            )
-
-            st.rerun()
-
-        except (
-            ValueError,
-            UnicodeError,
-            TypeError,
-            KeyError
-        ) as error:
-            st.error(
-                f"Could not import career: {error}"
-            )
-
-st.caption(
-    "Career history is saved in the current "
-    "Streamlit session. Download your career "
-    "JSON to continue on another day or device."
-)
-
-
-# ==============================================
-# POSTGAME MANAGER REPORT
-# ==============================================
-
-if (
-    current_game is not None
-    and current_game.get("finished")
-):
-
-    st.divider()
-
-    st.markdown(
-        "## 📄 POSTGAME MANAGER REPORT"
-    )
-
-    assessment = career_assessment(
-        current_game
-    )
-
-    st.markdown(
-        f"### Final Manager Grade: "
-        f"{assessment['letter']} "
-        f"({assessment['score']}/100)"
-    )
-
-    grade_rows = []
-
-    for category, points in (
-        assessment["categories"].items()
-    ):
-        grade_rows.append({
-            "Category": category,
-            "Points Earned": points
-        })
-
-    st.dataframe(
-        pd.DataFrame(grade_rows),
-        hide_index=True,
-        use_container_width=True
-    )
-
-    pdf_bytes = build_career_pdf(
-        current_game,
-        st.session_state.career_manager_name
-    )
-
-    st.download_button(
-        "📄 DOWNLOAD POSTGAME PDF + GRADE",
-        data=pdf_bytes,
-        file_name=(
-            f"manager_report_"
-            f"{current_game['year']}_"
-            f"{current_game['career_id'][:8]}.pdf"
-        ),
-        mime="application/pdf",
-        type="primary",
-        key="download_postgame_pdf"
-    )
-
-    st.success(
-        "Your completed game has been "
-        "added to your career history."
-    )
-
-# ==============================================
-# END OF CAREER MANAGER EXTENSION
-# ==============================================
