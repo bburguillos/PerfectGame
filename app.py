@@ -180,6 +180,100 @@ def h2h(pid, bid, year):
     return None
 
 
+# Phase 6B: park artwork is an illustrative overhead rendering, not aerial photography.
+# Dimensions are simplified styling cues, not official survey measurements.
+PARKS = {
+    'Boston Red Sox': ('Fenway Park', 'fenway', 1.05),
+    'New York Yankees': ('Yankee Stadium', 'short_right', 1.05),
+    'Colorado Rockies': ('Coors Field', 'wide', 1.12),
+    'Los Angeles Dodgers': ('Dodger Stadium', 'balanced', .98),
+    'Chicago Cubs': ('Wrigley Field', 'balanced', 1.02),
+    'San Francisco Giants': ('Oracle Park', 'deep_right', .96),
+    'Houston Astros': ('Minute Maid Park / Daikin Park', 'short_left', 1.01),
+    'New York Mets': ('Citi Field', 'balanced', .98),
+    'Baltimore Orioles': ('Oriole Park at Camden Yards', 'deep_left', .99),
+    'Pittsburgh Pirates': ('PNC Park', 'wide', .98),
+    'San Diego Padres': ('Petco Park', 'wide', .95),
+    'Seattle Mariners': ('T-Mobile Park', 'balanced', .96),
+    'Arizona Diamondbacks': ('Chase Field', 'balanced', 1.01),
+    'Texas Rangers': ('Globe Life Field', 'balanced', 1.00),
+    'St. Louis Cardinals': ('Busch Stadium', 'balanced', .98),
+    'Philadelphia Phillies': ('Citizens Bank Park', 'balanced', 1.04),
+    'Cincinnati Reds': ('Great American Ball Park', 'balanced', 1.07),
+    'Milwaukee Brewers': ('American Family Field', 'balanced', 1.01),
+    'Cleveland Guardians': ('Progressive Field', 'balanced', .99),
+    'Detroit Tigers': ('Comerica Park', 'wide', .97),
+    'Minnesota Twins': ('Target Field', 'balanced', 1.00),
+    'Kansas City Royals': ('Kauffman Stadium', 'wide', .99),
+    'Chicago White Sox': ('Guaranteed Rate Field', 'balanced', 1.01),
+    'Atlanta Braves': ('Truist Park', 'balanced', 1.00),
+    'Miami Marlins': ('loanDepot park', 'balanced', .97),
+    'Tampa Bay Rays': ('Tropicana Field', 'balanced', .97),
+    'Toronto Blue Jays': ('Rogers Centre', 'balanced', 1.02),
+    'Washington Nationals': ('Nationals Park', 'balanced', .99),
+    'Oakland Athletics': ('Oakland Coliseum', 'wide', .95),
+    'Athletics': ('Sutter Health Park (temporary)', 'balanced', 1.00),
+    'Los Angeles Angels': ('Angel Stadium', 'balanced', .99),
+}
+
+def park_info(team, year):
+    name, shape, sample_factor = PARKS.get(team, (str(team)+' home park', 'balanced', 1.0))
+    # The historical venue for a relocating/renamed franchise can differ.
+    if team == 'Athletics' and year < 2025:
+        name, shape, sample_factor = 'Oakland Coliseum', 'wide', .95
+    if team == 'Houston Astros' and year < 2025:
+        name = 'Minute Maid Park'
+    if team == 'Miami Marlins' and year < 2021:
+        name = 'Marlins Park'
+    if team == 'Tampa Bay Rays' and year == 2025:
+        name = 'George M. Steinbrenner Field (temporary)'
+    return {'name':name, 'shape':shape, 'factor':sample_factor}
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def team_defense(team_id,year):
+    # MLB team-level fielding data may be absent for some historical seasons.
+    # Missing inputs deliberately return an explicit neutral modeled rating.
+    try:
+        payload=fetch(f'teams/{int(team_id)}/stats', {'stats':'season','group':'fielding','season':year})
+        entries=[part.get('stat',{}) for section in payload.get('stats',[])
+                 for part in section.get('splits',[]) if part.get('stat')]
+        stats=entries[0] if entries else {}
+        pct=number(stats.get('fielding'),0)
+        if pct<=0:
+            pct=number(stats.get('fieldingPercentage'),0)
+        if not .95<=pct<=1.0:
+            return {'rating':5, 'fielding_pct':None, 'source':'Neutral estimate (MLB team fielding unavailable)'}
+        rating=int(bounded(round(5+(.985-pct)*-180),1,10))
+        return {'rating':rating,'fielding_pct':pct,'source':'MLB team fielding percentage; 1–10 rating modeled'}
+    except (requests.RequestException,ValueError,TypeError,KeyError):
+        return {'rating':5,'fielding_pct':None,'source':'Neutral estimate (MLB team fielding unavailable)'}
+
+# Small bounded effects preserve the preexisting hitting/pitching model.
+def defense_factor(g):
+    rating=number(g.get('team_defense',{}).get('rating'),5)
+    return bounded(1.0+(5-rating)*.018,.91,1.09)
+
+def event_alert(g, result, runs, inning_before, outs_before, bases_before):
+    alerts=[]
+    if result=='grounds into a DOUBLE PLAY' and sum(bool(x) for x in bases_before)>=2:
+        alerts.append('🧱 DOUBLE-PLAY ESCAPE — defense turns two under pressure!')
+    if all(bases_before) and runs==0 and result in ('strikes out','grounds into a DOUBLE PLAY','is retired on a ball in play'):
+        alerts.append('🚨 BASES-LOADED PRESSURE — huge out recorded!')
+    if g['strikeouts']>=10 and result=='strikes out' and g['strikeouts']==10:
+        alerts.append('🔥 DOUBLE-DIGIT STRIKEOUTS — 10 Ks!')
+    if g['hits']==0 and inning_before>=5 and g['outs']==0 and g['inning']>inning_before:
+        alerts.append('✨ NO-HITTER WATCH — no hits allowed through '+str(inning_before)+' innings!')
+    if g['runs']==0 and inning_before>=7 and g['outs']==0 and g['inning']>inning_before:
+        alerts.append('🔒 SHUTOUT WATCH — '+str(inning_before)+' scoreless innings in the books!')
+    if g['finished'] and g['runs']==0:
+        alerts.append('🏆 SHUTOUT COMPLETE — 27 outs, zero runs allowed!')
+    if alerts:
+        g['dramatic_alert']=alerts[-1]
+        g['event_history'].extend(alerts)
+        g['highlights'].extend(alerts)
+    else:
+        g['dramatic_alert']=''
+
 def starting_game(data, starter, mode):
     staff=data['staff']
     return dict(year=data['year'],team=data['team'],opponent=data['opponent'],staff=staff,
@@ -193,7 +287,10 @@ def starting_game(data, starter, mode):
       inning_start_runs=0,inning_reliever=False,jam_escaped=False,
       relief_scoreless=0,relief_inning_outs=0,career_id=str(uuid4()),career_saved=False,
       scouting=data.get('scouting',{}),confidence={x['id']:70 for x in staff},
-      mound_visits=5,visit_boost={x['id']:0 for x in staff},confidence_events=[])
+      mound_visits=5,visit_boost={x['id']:0 for x in staff},confidence_events=[],
+      park=data.get('park',park_info(data['team'],data['year'])),
+      team_defense=data.get('team_defense',{'rating':5,'source':'Neutral modeled rating'}),
+      errors=0,dramatic_alert='',event_history=[])
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -310,6 +407,9 @@ def estimate(g,p,h,approach='Balanced',defense='Normal'):
     if p['id']==g['pitcher'] and g.get('visit_boost',{}).get(p['id'],0)>0:
         wp*=.88
         hp*=.97
+    # A modest fielding adjustment changes ball-in-play hit likelihood.
+    hp*=defense_factor(g)
+    hp*=g.get('park',{}).get('factor',1.0)
     hp=bounded(hp,.04,.58);wp=bounded(wp,.01,.32);kp=bounded(kp,.02,max(.02,1-hp-wp))
     return hp,wp,kp
 
@@ -384,6 +484,17 @@ def advance_hit(g,distance):
 
 
 def walk_bases(g):
+    park=g.get('park',{})
+    shape=park.get('shape','balanced')
+    fence={
+        'fenway':'M0 93 L98 27 Q295 -15 550 70',
+        'short_right':'M0 73 Q240 -8 550 110',
+        'short_left':'M0 110 Q310 -8 550 73',
+        'wide':'M0 65 Q275 -45 550 65',
+        'deep_right':'M0 85 Q340 -44 550 65',
+        'deep_left':'M0 65 Q225 -44 550 85',
+        'balanced':'M0 75 Q275 -18 550 75',
+    }.get(shape,'M0 75 Q275 -18 550 75')
     a,b,c=g['bases'];score=int(a and b and c)
     g['bases']=[True,a or b,c or (a and b)];g['runs']+=score;g['walks']+=1
     return score
@@ -433,6 +544,7 @@ def simulate(g,approach,defense):
     hp,wp,kp=estimate(g,p,h,approach,defense)
     g['strategy_log'].append(dict(Inning=g['inning'],Batter=h['name'],Pitcher=p['name'],
       Approach=approach,Defense=defense,**{'Hit %':round(hp*100,1),'Walk %':round(wp*100,1)}))
+    inning_before=g['inning'];outs_before=g['outs'];bases_before=g['bases'].copy()
     roll=random.random();runs=0
     if roll<wp:runs=walk_bases(g);result='walks'
     elif roll<wp+hp:
@@ -445,17 +557,28 @@ def simulate(g,approach,defense):
             g['outs']+=2;g['double_plays']+=1;g['bases'][0]=False;result='grounds into a DOUBLE PLAY'
         elif g['bases'][2] and g['outs']<2 and random.random()<(.04 if defense=='Infield in' else .17):
             g['outs']+=1;g['bases'][2]=False;g['runs']+=1;runs=1;result='hits a sacrifice fly'
-        else:g['outs']+=1;result='is retired on a ball in play'
+        else:
+            # Defensive errors are separate from credited hits.
+            field_rating=number(g.get('team_defense',{}).get('rating'),5)
+            error_chance=bounded(.018+(5-field_rating)*.004,.005,.045)
+            if random.random()<error_chance:
+                runs=advance_hit(g,1)
+                g['errors']=g.get('errors',0)+1
+                result='reaches on a fielding ERROR'
+            else:
+                g['outs']+=1
+                result='is retired on a ball in play' 
     pitches=random.randint(4,9) if approach=='Pitch carefully' else random.randint(2,6) if approach=='Attack the zone' else random.randint(3,8)
     g['pitches'][p['id']]+=pitches;g['faced'][p['id']]+=1;g['appearance']+=1
     update_confidence(g,p,result,runs)
-    g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT'}.get(result,'OUT')
+    g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT','reaches on a fielding ERROR':'ERROR'}.get(result,'OUT')
     g['play_detail']=f"{h['name']} vs. {p['name']}";g['play_runs']=runs
     g['last_play']=f"Inning {g['inning']}: {h['name']} {result} vs. {p['name']} ({pitches} pitches)."+(f' {runs} run(s) score!' if runs else '')
     g['log'].append(g['last_play'])
     if g['play_result'] in ('HOME RUN!','TRIPLE','DOUBLE','STRIKEOUT','DOUBLE PLAY'):
         g['highlights'].append(g['last_play'])
     after_batter(g)
+    event_alert(g,result,runs,inning_before,outs_before,bases_before)
 
 
 def danger(g):
@@ -472,6 +595,17 @@ def diamond(g):
         fill = '#ffb33d' if occupied else '#f5e8c9'
         halo = '<circle cx="%s" cy="%s" r="20" fill="#ffb33d" opacity=".2"/>' % (x,y) if occupied else ''
         return halo + f'<rect x="{x-10}" y="{y-10}" width="20" height="20" transform="rotate(45 {x} {y})" fill="{fill}" stroke="#153c35" stroke-width="2"/>'
+    park=g.get('park',{})
+    shape=park.get('shape','balanced')
+    fence={
+        'fenway':'M0 93 L98 27 Q295 -15 550 70',
+        'short_right':'M0 73 Q240 -8 550 110',
+        'short_left':'M0 110 Q310 -8 550 73',
+        'wide':'M0 65 Q275 -45 550 65',
+        'deep_right':'M0 85 Q340 -44 550 65',
+        'deep_left':'M0 65 Q225 -44 550 85',
+        'balanced':'M0 75 Q275 -18 550 75',
+    }.get(shape,'M0 75 Q275 -18 550 75')
     a,b,c=g['bases']
     previous=g.get('prior_bases',[False,False,False])
     points=[(428,177),(275,66),(122,177)]
@@ -491,6 +625,8 @@ def diamond(g):
     runs=g.get('play_runs',0)
     ribbon=f'<div class="score">+{runs} RUNS</div>' if runs else ''
     result=(f'<div class="result"><div class="broadcast-tag">⚾ LAST PLAY</div><div class="big">{headline}</div><div class="detail">{detail}</div>{ribbon}</div>') if headline else ''
+    if g.get('dramatic_alert'):
+        result+='<div class="event-strip">'+escape(g["dramatic_alert"])+'</div>'
     hit_result=g.get('play_result','')
     fly_ball=hit_result in ('SINGLE','DOUBLE','TRIPLE','HOME RUN!')
     ball_effect='<div class="ball-flight">⚾</div>' if fly_ball else ''
@@ -498,6 +634,7 @@ def diamond(g):
     result=result.replace('class="result"', f'class="result {"home-run" if headline=="HOME RUN!" else ""}"')
     html=f"""<html><head><style>
     *{{box-sizing:border-box}}body{{margin:0;background:transparent;font-family:Arial,sans-serif;overflow:hidden}}
+    .event-strip{{position:absolute;bottom:5px;left:3%;width:94%;text-align:center;background:#102c43ee;color:#ffc16a;padding:5px;border:1px solid #e9a236;border-radius:7px;font:800 11px Arial;z-index:4}}
     .stadium{{position:relative;width:100%;height:310px;overflow:hidden;border-radius:16px;background:#092c29}}
     svg{{width:100%;height:100%;display:block}}
     .result{{position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);width:87%;background:rgba(6,22,35,.92);border:3px solid #ffb139;border-radius:16px;padding:17px;text-align:center;box-shadow:0 15px 30px #0009;animation:pop .38s ease-out, fadeAway .35s ease-in 3.2s forwards}}
@@ -516,8 +653,8 @@ def diamond(g):
       <defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#082439"/><stop offset="1" stop-color="#145039"/></linearGradient>
       <pattern id="grass" width="48" height="48" patternUnits="userSpaceOnUse" patternTransform="rotate(23)"><rect width="48" height="48" fill="#236b48"/><rect width="24" height="48" fill="#2e7c52"/></pattern></defs>
       <rect width="550" height="360" fill="url(#sky)"/>
-      <path d="M0 75 Q275 -18 550 75 L550 360 L0 360Z" fill="url(#grass)"/>
-      <path d="M0 75 Q275 -18 550 75" stroke="#e6bf64" stroke-width="7" fill="none"/>
+      <path d="{fence} L550 360 L0 360Z" fill="url(#grass)"/>
+      <path d="{fence}" stroke="#e6bf64" stroke-width="7" fill="none"/>
       <path d="M275 330 L86 177 L275 35 L464 177 Z" fill="#c58b55" stroke="#f3d6a6" stroke-width="3"/>
       <path d="M275 296 L122 177 L275 66 L428 177 Z" fill="#287247"/>
       <path d="M275 330 L8 110 M275 330 L542 110" stroke="#f6eed9" stroke-width="2"/>
@@ -525,7 +662,7 @@ def diamond(g):
       <ellipse cx="275" cy="199" rx="22" ry="13" fill="#c99a69"/>
       <rect x="266" y="197" width="18" height="5" rx="2" fill="#fff"/>
       <text x="15" y="24" fill="#ffcb80" font-size="15" font-weight="800">SPORTS BY THE NUMBERS</text>
-      <text x="15" y="46" fill="#fff" font-size="12">SHUTOUT CHALLENGE • LIVE</text>
+      <text x="15" y="46" fill="#fff" font-size="12">{escape(park.get('name','STADIUM')).upper()} • ILLUSTRATED OVERHEAD</text>
       <text x="535" y="24" text-anchor="end" fill="#fff" font-size="13">ORANGE = RUNNER ON BASE</text>
     </svg>{result}</div></body></html>"""
     components.html(html,height=316,scrolling=False)
@@ -618,7 +755,9 @@ def career_record(g, name):
         'team':str(g['team']), 'opponent':str(g['opponent']),
         'difficulty':str(g['mode']), 'runs':int(g['runs']),
         'hits':int(g['hits']), 'strikeouts':int(g['strikeouts']),
-        'shutout':g['runs']==0,
+        'shutout':g['runs']==0, 'errors':g.get('errors',0),
+        'park':g.get('park',{}).get('name',''),
+        'defense_rating':g.get('team_defense',{}).get('rating',5),
         'grade':assessment['score'], 'letter':assessment['letter'],
         'rubric':assessment['parts'],
         'achievements':list(g.get('achievements',[])),
@@ -689,6 +828,8 @@ def make_game_pdf(g, name):
         story.append(Paragraph('Selected threats: '+pdf_escape(selected),styles['SmallCustom']))
         story.append(Paragraph('Starter rationale: '+pdf_escape(scout.get('rationale','')),styles['SmallCustom']))
         story.append(Paragraph(f"Mound visits used: {5-g.get('mound_visits',5)}",styles['SmallCustom']))
+    story.append(Paragraph('Ballpark and defense',styles['SubtitleCustom']))
+    story.append(Paragraph('Park: '+pdf_escape(g.get('park',{}).get('name','Unknown'))+' | Defensive rating: '+str(g.get('team_defense',{}).get('rating',5))+'/10 | Errors: '+str(g.get('errors',0)),styles['SmallCustom']))
     story += [Paragraph('Game statistics',styles['SubtitleCustom']),
               Paragraph(f"Hits allowed: <b>{g['hits']}</b> | Strikeouts: <b>{g['strikeouts']}</b> | "
                         f"Double plays: <b>{g['double_plays']}</b> | Intentional walks: <b>{g['intentional_walks']}</b> | "
@@ -706,7 +847,7 @@ def make_game_pdf(g, name):
                 f"{pdf_escape(decision.get('New risk','—'))}.",styles['SmallCustom']))
     else:
         story.append(Paragraph('No pitching substitutions were made.',styles['SmallCustom']))
-    story.append(Paragraph('Major plays',styles['SubtitleCustom']))
+    story.append(Paragraph('Major plays and dramatic moments',styles['SubtitleCustom']))
     for highlight in g.get('highlights',[])[-4:]:
         story.append(Paragraph('• '+pdf_escape(highlight),styles['SmallCustom']))
     story += [Paragraph('Student reflection (complete after the game)',styles['SubtitleCustom'])]
@@ -741,7 +882,7 @@ def safe_career_import(raw):
     return clean_manager_name(data.get('manager','Manager')),cleaned
 
 
-st.title("⚾ YOU'RE THE MANAGER · CAREER STADIUM")
+st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
@@ -812,7 +953,8 @@ with st.expander('⚙️ NEW GAME • Season & matchup', expanded=st.session_sta
                 hitters=load_squad(teams[opp],year,'hitting')
                 progress.progress(90)
                 if staff and len(hitters)>=9:
-                    st.session_state.loaded=dict(year=year,team=own,opponent=opp,staff=staff,hitters=hitters)
+                    st.session_state.loaded=dict(year=year,team=own,opponent=opp,staff=staff,hitters=hitters,
+                       park=park_info(own,year),team_defense=team_defense(teams[own],year))
                     st.session_state.game=None
                     status.update(label='✅ Teams loaded',state='complete',expanded=False)
                 else:
@@ -859,6 +1001,8 @@ if g:
     p=pitcher(g)
     h=batter(g)
     st.markdown(f"**{g['year']} {g['team']} vs. {g['opponent']}** · {g['mode']} · Shutout Challenge")
+    if g.get('dramatic_alert'):
+        st.markdown(f"<div class='broadcast'><div class='eyebrow'>LIVE GAME ALERT</div><div class='headline'>{escape(g['dramatic_alert'])}</div></div>",unsafe_allow_html=True)
     # One single-row compact scoreboard, instead of six large metric cards.
     scoreboard=(f"<div class='score-strip'>"
                 f"<span>INNING <b>{min(9,g['inning'])}</b></span>"
@@ -877,6 +1021,7 @@ if g:
     selected=available_ids.get(selected_id)
     with left:
         st.markdown('##### 🔥 BULLPEN')
+        st.caption(f"🧤 Team defense {g.get('team_defense',{}).get('rating',5)}/10 · {g.get('team_defense',{}).get('source','Estimated')}")
         st.markdown(f"**{escape(p['name'])}** · {throwing(p['throws'])} · {p['role']}")
         st.caption(f"ON MOUND · ERA {p['stats'].get('era','—')} · WHIP {p['stats'].get('whip','—')}")
         st.progress(bounded(fatigue(g,p),0,1),text=f"Fatigue {fatigue(g,p):.0%}")
@@ -942,6 +1087,7 @@ if g:
                 st.rerun()
         else:
             st.success('🏆 SHUTOUT!' if g['runs']==0 else f"FINAL · {g['runs']} runs allowed")
+        st.caption(f"🏟️ {g.get('park',{}).get('name','Stadium')} · stylized overhead · modeled park factor {g.get('park',{}).get('factor',1):.2f}×")
         diamond(g)
         if g.get('last_play') and g['last_play']!='Game begins!':
             st.caption('📻 '+g['last_play'])
@@ -1004,6 +1150,9 @@ if g:
         st.dataframe(pd.DataFrame([{'Category':k,'Points':v} for k,v in assessment['parts'].items()]),hide_index=True,use_container_width=True)
         for note in assessment['notes']:st.caption('• '+note)
         for achievement in g['achievements']:st.success('🏅 '+achievement)
+        if g.get('event_history'):
+            st.markdown('#### 🎙️ Dramatic game moments')
+            for event in reversed(g['event_history'][-12:]):st.write(event)
         if g['highlights']:
             st.markdown('#### Broadcast highlights')
             for highlight in reversed(g['highlights'][-8:]):st.write(highlight)
