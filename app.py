@@ -590,26 +590,43 @@ def danger(g):
     return None
 
 
+# Phase 6B.1 stadium gallery. Geometries are original, schematic illustrations.
+# Each park has a separate wall perimeter, grandstand footprint and signature feature.
+STADIUM_BLUEPRINTS = {
+ 'fenway': {'wall':'M18 134 L18 66 L101 66 L101 45 L184 28 L248 15 L338 32 L419 51 L532 98', 'bowl':'M5 166 L5 39 L82 39 L82 15 Q260 -48 438 19 L545 72', 'accent':'#bd3039', 'label':'GREEN MONSTER', 'landmark':'<rect x="18" y="64" width="13" height="89" fill="#17653b" stroke="#9acc9e" stroke-width="2"/><g fill="#c5eed4" font-size="10" font-weight="bold"><text x="36" y="84">GREEN</text><text x="36" y="97">MONSTER</text></g>', 'shape':'LEFT-FIELD WALL'},
+ 'yankee': {'wall':'M18 112 Q100 28 230 23 Q325 5 392 29 L531 144', 'bowl':'M3 132 Q92 -15 238 3 Q355 -32 424 12 L545 164', 'accent':'#c2c8d8', 'label':'SHORT RIGHT PORCH', 'landmark':'<path d="M386 30 Q472 54 529 143" fill="none" stroke="#f8f5e9" stroke-width="9" stroke-dasharray="6 5"/><text x="388" y="75" font-size="11" fill="white">RF PORCH</text>', 'shape':'ASYMMETRIC RIGHT FIELD'},
+ 'citi': {'wall':'M16 125 L55 101 L55 65 L152 41 L225 33 L280 10 L360 33 L454 47 L535 120', 'bowl':'M2 148 L33 131 L33 45 L147 22 L223 14 L279 -11 L365 14 L473 25 L548 105', 'accent':'#f58220', 'label':'CITI FIELD', 'landmark':'<rect x="218" y="12" width="94" height="18" rx="5" fill="#124f89"/><text x="265" y="24" text-anchor="middle" font-weight="bold" font-size="11" fill="#fff">METS</text>', 'shape':'STEPPED OUTFIELD'},
+ 'wrigley': {'wall':'M20 100 L116 57 L201 31 L346 31 L438 53 L531 105', 'bowl':'M6 124 L98 33 L190 10 L360 10 L458 31 L545 129', 'accent':'#b72434', 'label':'IVY WALL / BLEACHERS', 'landmark':'<path d="M20 100 L116 57 L201 31 L346 31 L438 53 L531 105" fill="none" stroke="#46ad58" stroke-width="10" stroke-dasharray="9 3"/><rect x="232" y="6" width="86" height="23" rx="5" fill="#c82936"/><text x="275" y="21" text-anchor="middle" font-size="10" font-weight="bold" fill="white">WRIGLEY</text>', 'shape':'RECTANGULAR BLEACHERS'},
+ 'dodger': {'wall':'M20 123 Q67 47 157 17 Q275 -28 393 17 Q483 47 530 123', 'bowl':'M4 157 Q31 21 159 -11 Q275 -54 392 -11 Q519 24 546 157', 'accent':'#397bd3', 'label':'CLASSIC SYMMETRIC BOWL', 'landmark':'<path d="M151 18 Q275 -42 398 18" stroke="#86a8ec" stroke-width="15" fill="none"/><text x="275" y="22" font-size="11" text-anchor="middle" fill="white">DODGER BLUE</text>', 'shape':'SYMMETRIC OUTFIELD'},
+ 'coors': {'wall':'M12 105 L69 65 L145 17 L235 3 L305 2 L403 23 L483 64 L538 104', 'bowl':'M2 142 L43 40 L130 -7 L230 -25 L312 -26 L417 -2 L502 38 L548 142', 'accent':'#7658a1', 'label':'DEEP OUTFIELD / ROCKPILE', 'landmark':'<path d="M219 8 L240 -14 L254 3 L274 -21 L297 6 L315 -9 L341 17 Z" fill="#a6aabb" stroke="#eee" stroke-width="2"/><text x="275" y="49" font-size="11" text-anchor="middle" fill="white">ROCKPILE</text>', 'shape':'SPACIOUS ALLEYS'},
+ 'oracle': {'wall':'M16 119 L91 70 L174 32 Q270 -8 354 16 L427 59 L471 59 L471 98 L532 130', 'bowl':'M2 145 L72 42 L158 9 Q283 -28 366 -6 L438 31 L486 34 L486 68 L547 103', 'accent':'#ef843d', 'label':'MCCOVEY COVE', 'landmark':'<path d="M470 10 L550 0 L550 130 L471 97 L471 59 Z" fill="#176c9e" opacity=".94"/><g fill="none" stroke="#7cd1f5" opacity=".7"><path d="M493 20 Q522 10 548 21"/><path d="M484 43 Q518 30 546 43"/><path d="M480 65 Q513 53 545 67"/></g><text x="507" y="90" fill="white" font-size="11" text-anchor="middle">COVE</text>', 'shape':'RIGHT FIELD WATERFRONT'},
+ 'camden': {'wall':'M18 116 L83 68 L139 48 L139 26 L225 16 L309 24 L388 48 L465 66 L531 118', 'bowl':'M3 150 L62 47 L120 30 L120 7 L227 -5 L322 4 L402 25 L491 47 L548 140', 'accent':'#ee7822', 'label':'WAREHOUSE BEYOND RF', 'landmark':'<rect x="433" y="9" width="104" height="33" fill="#b34533" transform="rotate(9 433 9)"/><g stroke="#efb399" stroke-width="2"><path d="M442 12 L438 37 M457 15 L454 40 M472 18 L470 43 M487 20 L485 46 M502 22 L500 48 M517 24 L515 50"/></g><text x="444" y="16" font-size="9" fill="white">WAREHOUSE</text>', 'shape':'CAMDEN WAREHOUSE'},
+ 'pnc': {'wall':'M19 115 L91 63 L174 25 L278 20 L365 33 L444 66 L531 115', 'bowl':'M3 142 L73 41 L163 1 L279 -4 L380 9 L460 42 L548 141', 'accent':'#f0b934', 'label':'RIVER AND BRIDGE VIEW', 'landmark':'<path d="M72 7 Q250 -20 459 8" stroke="#2997ba" stroke-width="16" fill="none"/><path d="M150 4 L391 4 M164 -1 L164 11 M379 -1 L379 11" stroke="#f4c541" stroke-width="5"/><text x="269" y="32" text-anchor="middle" font-size="11" fill="white">ALLEGHENY</text>', 'shape':'RIVERSIDE PARK'},
+ 'petco': {'wall':'M20 125 L85 81 L148 35 L245 26 L307 11 L397 48 L475 60 L532 122', 'bowl':'M5 154 L63 60 L125 14 L235 5 L304 -12 L417 26 L494 39 L547 146', 'accent':'#e0bf86', 'label':'WESTERN METAL BUILDING', 'landmark':'<rect x="12" y="43" width="74" height="67" fill="#997e5d" stroke="#dbc5a0" stroke-width="3"/><path d="M20 60 H78 M20 75 H78 M20 90 H78 M35 47 V103 M55 47 V103" stroke="#efd9b0" stroke-width="3"/><text x="18" y="41" font-size="9" fill="white">WESTERN METAL</text>', 'shape':'CITY-BLOCK CORNER'},
+}
+STADIUM_KEY_BY_NAME = {
+    'Fenway Park':'fenway', 'Yankee Stadium':'yankee', 'Citi Field':'citi',
+    'Wrigley Field':'wrigley','Dodger Stadium':'dodger','Coors Field':'coors',
+    'Oracle Park':'oracle','Oriole Park at Camden Yards':'camden',
+    'PNC Park':'pnc','Petco Park':'petco',
+}
+
 def diamond(g):
     def marker(x, y, occupied):
         fill = '#ffb33d' if occupied else '#f5e8c9'
-        halo = '<circle cx="%s" cy="%s" r="20" fill="#ffb33d" opacity=".2"/>' % (x,y) if occupied else ''
+        halo = f'<circle cx="{x}" cy="{y}" r="20" fill="#ffb33d" opacity=".2"/>' if occupied else ''
         return halo + f'<rect x="{x-10}" y="{y-10}" width="20" height="20" transform="rotate(45 {x} {y})" fill="{fill}" stroke="#153c35" stroke-width="2"/>'
     park=g.get('park',{})
-    shape=park.get('shape','balanced')
-    fence={
-        'fenway':'M0 93 L98 27 Q295 -15 550 70',
-        'short_right':'M0 73 Q240 -8 550 110',
-        'short_left':'M0 110 Q310 -8 550 73',
-        'wide':'M0 65 Q275 -45 550 65',
-        'deep_right':'M0 85 Q340 -44 550 65',
-        'deep_left':'M0 65 Q225 -44 550 85',
-        'balanced':'M0 75 Q275 -18 550 75',
-    }.get(shape,'M0 75 Q275 -18 550 75')
+    park_name=park.get('name','STADIUM')
+    stadium_key=STADIUM_KEY_BY_NAME.get(park_name)
+    blueprint=STADIUM_BLUEPRINTS.get(stadium_key)
+    if blueprint is None:
+        blueprint={'wall':'M18 115 Q275 -40 532 115','bowl':'M5 147 Q275 -70 545 147','accent':'#93b4ad','label':'HOME BALLPARK','landmark':'','shape':'CLASSIC BALLPARK'}
+    fence=blueprint['wall']
+    bowl=blueprint['bowl']
     a,b,c=g['bases']
     previous=g.get('prior_bases',[False,False,False])
     points=[(428,177),(275,66),(122,177)]
-    # Visual animation approximates runner progress between previous and current occupied bases.
     runner_trails=''
     if g.get('play_result') in ('SINGLE','DOUBLE','TRIPLE','HOME RUN!','WALK','INTENTIONAL WALK'):
         incoming=[points[i] for i,occupied in enumerate(previous) if occupied]
@@ -626,7 +643,7 @@ def diamond(g):
     ribbon=f'<div class="score">+{runs} RUNS</div>' if runs else ''
     result=(f'<div class="result"><div class="broadcast-tag">⚾ LAST PLAY</div><div class="big">{headline}</div><div class="detail">{detail}</div>{ribbon}</div>') if headline else ''
     if g.get('dramatic_alert'):
-        result+='<div class="event-strip">'+escape(g["dramatic_alert"])+'</div>'
+        result+='<div class="event-strip">'+escape(g["dramatic_alert"])+ '</div>'
     hit_result=g.get('play_result','')
     fly_ball=hit_result in ('SINGLE','DOUBLE','TRIPLE','HOME RUN!')
     ball_effect='<div class="ball-flight">⚾</div>' if fly_ball else ''
@@ -637,7 +654,7 @@ def diamond(g):
     .event-strip{{position:absolute;bottom:5px;left:3%;width:94%;text-align:center;background:#102c43ee;color:#ffc16a;padding:5px;border:1px solid #e9a236;border-radius:7px;font:800 11px Arial;z-index:4}}
     .stadium{{position:relative;width:100%;height:310px;overflow:hidden;border-radius:16px;background:#092c29}}
     svg{{width:100%;height:100%;display:block}}
-    .result{{position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);width:87%;background:rgba(6,22,35,.92);border:3px solid #ffb139;border-radius:16px;padding:17px;text-align:center;box-shadow:0 15px 30px #0009;animation:pop .38s ease-out, fadeAway .35s ease-in 3.2s forwards}}
+    .result{{position:absolute;left:50%;top:54%;transform:translate(-50%,-50%);width:87%;background:rgba(6,22,35,.92);border:3px solid #ffb139;border-radius:16px;padding:17px;text-align:center;box-shadow:0 15px 30px #0009;animation:pop .38s ease-out, fadeAway .35s ease-in 3.2s forwards;z-index:5}}
     .broadcast-tag{{color:#ffb33d;font:800 10px Arial;letter-spacing:2px;margin-bottom:6px}}
     .moving-runner{{filter:drop-shadow(0px 1px 3px #000);animation:runbase 1.45s ease-in-out both;transform-box:fill-box;transform-origin:center}}
     @keyframes runbase{{0%{{opacity:0;transform:translate(0,0) scale(.6)}}20%{{opacity:1}}85%{{opacity:1}}100%{{opacity:0;transform:translate(var(--dx),var(--dy)) scale(.8)}}}}
@@ -651,19 +668,26 @@ def diamond(g):
     </style></head><body><div class="stadium">
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 550 360" preserveAspectRatio="xMidYMid meet">
       <defs><linearGradient id="sky" x2="0" y2="1"><stop stop-color="#082439"/><stop offset="1" stop-color="#145039"/></linearGradient>
-      <pattern id="grass" width="48" height="48" patternUnits="userSpaceOnUse" patternTransform="rotate(23)"><rect width="48" height="48" fill="#236b48"/><rect width="24" height="48" fill="#2e7c52"/></pattern></defs>
+      <pattern id="grass" width="48" height="48" patternUnits="userSpaceOnUse" patternTransform="rotate(23)"><rect width="48" height="48" fill="#236b48"/><rect width="24" height="48" fill="#2e7c52"/></pattern>
+      <pattern id="seats" width="11" height="11" patternUnits="userSpaceOnUse"><rect width="11" height="11" fill="#233f51"/><path d="M0 4 H11 M4 0 V11" stroke="{blueprint['accent']}" opacity=".65" stroke-width="1.5"/></pattern></defs>
       <rect width="550" height="360" fill="url(#sky)"/>
+      <path d="{bowl} L548 178 L2 178 Z" fill="url(#seats)" stroke="{blueprint['accent']}" stroke-width="7"/>
+      <path d="{bowl}" fill="none" stroke="#8294a0" stroke-width="20" opacity=".6"/>
+      <path d="{bowl}" fill="none" stroke="#132331" stroke-width="3" stroke-dasharray="4 8"/>
       <path d="{fence} L550 360 L0 360Z" fill="url(#grass)"/>
-      <path d="{fence}" stroke="#e6bf64" stroke-width="7" fill="none"/>
+      <path d="{fence}" stroke="#f1d18a" stroke-width="7" fill="none"/>
+      {blueprint['landmark']}
       <path d="M275 330 L86 177 L275 35 L464 177 Z" fill="#c58b55" stroke="#f3d6a6" stroke-width="3"/>
       <path d="M275 296 L122 177 L275 66 L428 177 Z" fill="#287247"/>
       <path d="M275 330 L8 110 M275 330 L542 110" stroke="#f6eed9" stroke-width="2"/>
       {marker(428,177,a)}{marker(275,66,b)}{marker(122,177,c)}{marker(275,324,False)}{runner_trails}
       <ellipse cx="275" cy="199" rx="22" ry="13" fill="#c99a69"/>
       <rect x="266" y="197" width="18" height="5" rx="2" fill="#fff"/>
-      <text x="15" y="24" fill="#ffcb80" font-size="15" font-weight="800">SPORTS BY THE NUMBERS</text>
-      <text x="15" y="46" fill="#fff" font-size="12">{escape(park.get('name','STADIUM')).upper()} • ILLUSTRATED OVERHEAD</text>
-      <text x="535" y="24" text-anchor="end" fill="#fff" font-size="13">ORANGE = RUNNER ON BASE</text>
+      <rect x="8" y="7" width="218" height="45" rx="8" fill="#071c28" opacity=".96"/>
+      <text x="17" y="24" fill="#ffcb80" font-size="12" font-weight="800">{escape(park_name.upper())}</text>
+      <text x="17" y="41" fill="#fff" font-size="10">{escape(blueprint['label'])} · ILLUSTRATED AERIAL</text>
+      <rect x="388" y="7" width="152" height="30" rx="6" fill="#071c28" opacity=".92"/>
+      <text x="534" y="26" text-anchor="end" fill="#ffc978" font-size="11">{escape(blueprint['shape'])}</text>
     </svg>{result}</div></body></html>"""
     components.html(html,height=316,scrolling=False)
 
@@ -882,7 +906,7 @@ def safe_career_import(raw):
     return clean_manager_name(data.get('manager','Manager')),cleaned
 
 
-st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B")
+st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.1")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
