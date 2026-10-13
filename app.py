@@ -700,3 +700,979 @@ if g:
         st.session_state.selected_relief_id=None
         st.rerun()
 st.caption('Real MLB historical season statistics; game results, stamina and matchup projections are simulated.')
+
+# ==============================================
+# CAREER MANAGER + POSTGAME PDF EXTENSION
+# Paste this at the VERY END of your app.py
+# ==============================================
+
+import json
+from io import BytesIO
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    KeepTogether
+)
+from reportlab.lib import colors
+from reportlab.lib.styles import (
+    getSampleStyleSheet,
+    ParagraphStyle
+)
+from reportlab.lib.enums import TA_CENTER
+from xml.sax.saxutils import escape as pdf_escape
+
+
+# ==============================================
+# CAREER STORAGE
+# ==============================================
+
+if "career_games" not in st.session_state:
+    st.session_state.career_games = []
+
+if "career_manager_name" not in st.session_state:
+    st.session_state.career_manager_name = "Manager"
+
+
+def career_letter(score):
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 70:
+        return "C"
+    elif score >= 60:
+        return "D"
+    return "F"
+
+
+# ==============================================
+# MANAGER GRADING RUBRIC
+# ==============================================
+
+def career_assessment(game):
+    """
+    100-point educational rubric.
+
+    Engagement: 20 points
+    Bullpen decisions: 30 points
+    Situational strategy: 30 points
+    Run prevention: 20 points
+
+    Performance is partly luck-dependent.
+    This grade is a classroom teaching tool.
+    """
+
+    changes = game.get("decisions", [])
+    strategies = game.get("strategy_log", [])
+
+    # ENGAGEMENT: 20 POINTS
+
+    plate_appearances = len(strategies)
+
+    participation = min(
+        1.0,
+        plate_appearances / 27
+    )
+
+    strategic_choices = sum(
+        1 for action in strategies
+        if (
+            action.get("Approach") not in (
+                "Balanced", None
+            )
+            or action.get("Defense") not in (
+                "Normal", None, "—"
+            )
+        )
+    )
+
+    engagement = min(
+        20,
+        round(
+            16 * participation
+            + 4 * min(
+                1.0, strategic_choices / 6
+            )
+        )
+    )
+
+    # BULLPEN DECISIONS: 30 POINTS
+    # Keeping an effective starter in is not
+    # automatically a bad decision.
+
+    if changes:
+        better_matchups = sum(
+            1 for change in changes
+            if change.get("Improved proxy", False)
+        )
+
+        timely_changes = sum(
+            1 for change in changes
+            if number(
+                change.get("Fatigue at change"),
+                150
+            ) <= 110
+        )
+
+        bullpen = round(
+            10
+            + 12 * better_matchups / len(changes)
+            + 8 * timely_changes / len(changes)
+        )
+    else:
+        bullpen = 24
+
+    bullpen = min(30, bullpen)
+
+    # SITUATIONAL STRATEGY: 30 POINTS
+
+    involved_decisions = sum(
+        1 for action in strategies
+        if (
+            action.get("Approach") in (
+                "Pitch carefully",
+                "Attack the zone",
+                "Intentional walk"
+            )
+            or action.get("Defense") in (
+                "Infield in",
+                "Double-play depth"
+            )
+        )
+    )
+
+    strategy = min(
+        30,
+        round(
+            18
+            + 12 * min(
+                1.0,
+                involved_decisions / 7
+            )
+        )
+    )
+
+    # RUN PREVENTION: 20 POINTS
+
+    runs = int(game.get("runs", 0))
+
+    run_prevention = max(
+        0,
+        20 - min(20, runs * 3)
+    )
+
+    categories = {
+        "Engagement": engagement,
+        "Bullpen decisions": bullpen,
+        "Situational strategy": strategy,
+        "Run prevention": run_prevention
+    }
+
+    score = max(
+        0,
+        min(100, sum(categories.values()))
+    )
+
+    comments = []
+
+    if changes:
+        good = sum(
+            bool(c.get("Improved proxy"))
+            for c in changes
+        )
+
+        comments.append(
+            f"{good} of {len(changes)} pitching "
+            "changes lowered the estimated "
+            "matchup-risk index."
+        )
+    else:
+        comments.append(
+            "No pitching changes were made. "
+            "That is not automatically a mistake."
+        )
+
+    comments.append(
+        f"You made {len(strategies)} recorded "
+        "plate-appearance strategy decisions."
+    )
+
+    if runs == 0:
+        comments.append(
+            "Shutout achieved! You completed "
+            "nine scoreless innings."
+        )
+    else:
+        comments.append(
+            "Runs allowed represent only 20% "
+            "of the grade because simulation "
+            "outcomes also involve luck."
+        )
+
+    return {
+        "score": score,
+        "letter": career_letter(score),
+        "categories": categories,
+        "comments": comments
+    }
+
+
+# ==============================================
+# SAVE A COMPLETED GAME
+# ==============================================
+
+def career_game_record(game, manager):
+    result = career_assessment(game)
+
+    return {
+        "id": game["career_id"],
+        "date": datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M UTC"),
+        "manager": manager,
+        "season": game["year"],
+        "team": game["team"],
+        "opponent": game["opponent"],
+        "difficulty": game["mode"],
+        "runs": game["runs"],
+        "hits": game["hits"],
+        "strikeouts": game["strikeouts"],
+        "shutout": game["runs"] == 0,
+        "grade": result["score"],
+        "letter": result["letter"],
+        "achievements": list(
+            game.get("achievements", [])
+        ),
+        "pitching_changes": len(
+            game.get("decisions", [])
+        )
+    }
+
+
+def record_completed_career_game(game):
+    if game is None:
+        return
+
+    if not game.get("finished"):
+        return
+
+    if "career_id" not in game:
+        game["career_id"] = str(uuid4())
+
+    existing = {
+        record["id"]
+        for record in st.session_state.career_games
+    }
+
+    if game["career_id"] in existing:
+        return
+
+    record = career_game_record(
+        game,
+        st.session_state.career_manager_name
+    )
+
+    st.session_state.career_games.append(record)
+
+
+# ==============================================
+# GENERATE POSTGAME PDF
+# ==============================================
+
+def build_career_pdf(game, manager):
+    assessment = career_assessment(game)
+
+    output = BytesIO()
+
+    doc = SimpleDocTemplate(
+        output,
+        pagesize=(612, 792),
+        rightMargin=42,
+        leftMargin=42,
+        topMargin=36,
+        bottomMargin=36
+    )
+
+    styles = getSampleStyleSheet()
+
+    styles.add(
+        ParagraphStyle(
+            name="ManagerTitle",
+            parent=styles["Heading1"],
+            fontSize=19,
+            leading=23,
+            textColor=colors.HexColor(
+                "#E77826"
+            ),
+            spaceAfter=12
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="ManagerSection",
+            parent=styles["Heading2"],
+            fontSize=12,
+            leading=15,
+            textColor=colors.HexColor(
+                "#16394A"
+            ),
+            spaceBefore=12,
+            spaceAfter=7
+        )
+    )
+
+    styles.add(
+        ParagraphStyle(
+            name="ManagerBody",
+            parent=styles["Normal"],
+            fontSize=9,
+            leading=13,
+            spaceAfter=7
+        )
+    )
+
+    story = []
+
+    story.append(
+        Paragraph(
+            "SPORTS BY THE NUMBERS",
+            styles["ManagerTitle"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "<b>YOU'RE THE MANAGER</b>"
+            " | OFFICIAL POSTGAME REPORT",
+            styles["ManagerSection"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            f"<b>Manager:</b> "
+            f"{pdf_escape(manager)}",
+            styles["ManagerBody"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            f"<b>Matchup:</b> "
+            f"{pdf_escape(str(game['year']))} "
+            f"{pdf_escape(game['team'])} "
+            f"vs. {pdf_escape(game['opponent'])}",
+            styles["ManagerBody"]
+        )
+    )
+
+    story.append(
+        Paragraph(
+            f"<b>Difficulty:</b> "
+            f"{pdf_escape(game['mode'])}",
+            styles["ManagerBody"]
+        )
+    )
+
+    story.append(Spacer(1, 10))
+
+    # LARGE GRADE BANNER
+
+    grade_table = Table(
+        [[
+            f"{assessment['score']}/100",
+            f"GRADE {assessment['letter']}",
+            (
+                "SHUTOUT!"
+                if game["runs"] == 0
+                else f"{game['runs']} RUNS ALLOWED"
+            )
+        ]],
+        colWidths=[170, 170, 170],
+        rowHeights=[48]
+    )
+
+    grade_table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0), (-1, -1),
+                colors.HexColor("#15364B")
+            ),
+            (
+                "TEXTCOLOR",
+                (0, 0), (-1, -1),
+                colors.white
+            ),
+            (
+                "FONTNAME",
+                (0, 0), (-1, -1),
+                "Helvetica-Bold"
+            ),
+            (
+                "FONTSIZE",
+                (0, 0), (-1, -1),
+                14
+            ),
+            (
+                "ALIGN",
+                (0, 0), (-1, -1),
+                "CENTER"
+            ),
+            (
+                "VALIGN",
+                (0, 0), (-1, -1),
+                "MIDDLE"
+            )
+        ])
+    )
+
+    story.append(grade_table)
+
+    # SCORING BREAKDOWN
+
+    story.append(
+        Paragraph(
+            "MANAGER GRADING RUBRIC",
+            styles["ManagerSection"]
+        )
+    )
+
+    maximums = {
+        "Engagement": 20,
+        "Bullpen decisions": 30,
+        "Situational strategy": 30,
+        "Run prevention": 20
+    }
+
+    rubric_rows = [[
+        "Category",
+        "Points Earned",
+        "Maximum"
+    ]]
+
+    for category, earned in (
+        assessment["categories"].items()
+    ):
+        rubric_rows.append([
+            category,
+            str(earned),
+            str(maximums[category])
+        ])
+
+    rubric_table = Table(
+        rubric_rows,
+        colWidths=[270, 120, 120]
+    )
+
+    rubric_table.setStyle(
+        TableStyle([
+            (
+                "BACKGROUND",
+                (0, 0), (-1, 0),
+                colors.HexColor("#E5EDF2")
+            ),
+            (
+                "GRID",
+                (0, 0), (-1, -1),
+                0.4,
+                colors.HexColor("#BBCAD1")
+            ),
+            (
+                "FONTNAME",
+                (0, 0), (-1, 0),
+                "Helvetica-Bold"
+            ),
+            (
+                "FONTSIZE",
+                (0, 0), (-1, -1),
+                9
+            ),
+            (
+                "TOPPADDING",
+                (0, 0), (-1, -1),
+                7
+            ),
+            (
+                "BOTTOMPADDING",
+                (0, 0), (-1, -1),
+                7
+            )
+        ])
+    )
+
+    story.append(rubric_table)
+
+    # GAME STATISTICS
+
+    story.append(
+        Paragraph(
+            "GAME STATISTICS",
+            styles["ManagerSection"]
+        )
+    )
+
+    stats_text = (
+        f"<b>Runs:</b> {game['runs']} | "
+        f"<b>Hits:</b> {game['hits']} | "
+        f"<b>Strikeouts:</b> "
+        f"{game['strikeouts']} | "
+        f"<b>Double Plays:</b> "
+        f"{game['double_plays']} | "
+        f"<b>Pitching Changes:</b> "
+        f"{len(game['decisions'])}"
+    )
+
+    story.append(
+        Paragraph(
+            stats_text,
+            styles["ManagerBody"]
+        )
+    )
+
+    # GRADE COMMENTS
+
+    story.append(
+        Paragraph(
+            "MANAGER FEEDBACK",
+            styles["ManagerSection"]
+        )
+    )
+
+    for comment in assessment["comments"]:
+        story.append(
+            Paragraph(
+                pdf_escape(comment),
+                styles["ManagerBody"]
+            )
+        )
+
+    # PITCHING CHANGES
+
+    story.append(
+        Paragraph(
+            "IMPORTANT PITCHING DECISIONS",
+            styles["ManagerSection"]
+        )
+    )
+
+    if game.get("decisions"):
+        for change in game["decisions"][:8]:
+            description = (
+                f"Inning "
+                f"{change.get('Inning', '?')}: "
+                f"{change.get('Out', '?')} "
+                f"replaced by "
+                f"{change.get('In', '?')}. "
+                f"Reason: "
+                f"{change.get('Reason', '—')}. "
+                f"Risk index: "
+                f"{change.get('Old risk', '—')} "
+                f"to "
+                f"{change.get('New risk', '—')}."
+            )
+
+            story.append(
+                Paragraph(
+                    pdf_escape(description),
+                    styles["ManagerBody"]
+                )
+            )
+    else:
+        story.append(
+            Paragraph(
+                "No pitching substitutions "
+                "were made.",
+                styles["ManagerBody"]
+            )
+        )
+
+    # ACHIEVEMENTS
+
+    achievements = game.get(
+        "achievements", []
+    )
+
+    if achievements:
+        story.append(
+            Paragraph(
+                "ACHIEVEMENTS",
+                styles["ManagerSection"]
+            )
+        )
+
+        for achievement in achievements:
+            story.append(
+                Paragraph(
+                    pdf_escape(achievement),
+                    styles["ManagerBody"]
+                )
+            )
+
+    # STUDENT REFLECTION
+
+    story.append(
+        Paragraph(
+            "STUDENT REFLECTION",
+            styles["ManagerSection"]
+        )
+    )
+
+    questions = [
+        (
+            "1. Which managerial decision "
+            "was most important? Support "
+            "your answer with two statistics."
+        ),
+        (
+            "2. Describe one decision that "
+            "was statistically reasonable, "
+            "even if the outcome was unlucky."
+        ),
+        (
+            "3. What would you change "
+            "about your strategy next time?"
+        )
+    ]
+
+    for question in questions:
+        story.append(
+            Paragraph(
+                pdf_escape(question),
+                styles["ManagerBody"]
+            )
+        )
+
+        story.append(
+            Paragraph(
+                "_" * 86,
+                styles["ManagerBody"]
+            )
+        )
+
+    story.append(Spacer(1, 10))
+
+    story.append(
+        Paragraph(
+            "This report uses a classroom "
+            "assessment model. Historical MLB "
+            "statistics inform simulated outcomes. "
+            "Manager grades are not official "
+            "evaluations of baseball strategy.",
+            styles["ManagerBody"]
+        )
+    )
+
+    doc.build(story)
+
+    return output.getvalue()
+
+
+# ==============================================
+# CAREER MANAGEMENT SCREEN
+# ==============================================
+
+st.divider()
+
+st.markdown(
+    "## 🏆 CAREER MANAGER MODE"
+)
+
+st.caption(
+    "Your career tracks completed games, "
+    "shutouts, achievements, and manager grades."
+)
+
+st.text_input(
+    "Manager name or student ID",
+    key="career_manager_name",
+    max_chars=45,
+    help=(
+        "For classroom use, consider student "
+        "IDs instead of full names."
+    )
+)
+
+# Save finished game just once.
+current_game = st.session_state.get("game")
+
+if current_game is not None:
+    if "career_id" not in current_game:
+        current_game["career_id"] = str(uuid4())
+
+    record_completed_career_game(
+        current_game
+    )
+
+career = st.session_state.career_games
+
+# CAREER STATS
+
+games_played = len(career)
+
+shutouts = sum(
+    1 for game_record in career
+    if game_record.get("shutout")
+)
+
+average_grade = (
+    sum(
+        game_record.get("grade", 0)
+        for game_record in career
+    ) / games_played
+    if games_played else 0
+)
+
+best_grade = max(
+    (
+        game_record.get("grade", 0)
+        for game_record in career
+    ),
+    default=0
+)
+
+career_col1, career_col2, career_col3, career_col4 = (
+    st.columns(4)
+)
+
+career_col1.metric(
+    "Games Managed",
+    games_played
+)
+
+career_col2.metric(
+    "Career Shutouts",
+    shutouts
+)
+
+career_col3.metric(
+    "Average Grade",
+    f"{average_grade:.1f}"
+    if games_played else "—"
+)
+
+career_col4.metric(
+    "Best Grade",
+    best_grade if games_played else "—"
+)
+
+# CAREER HISTORY
+
+if career:
+    with st.expander(
+        "📋 View Career History"
+    ):
+        career_table = pd.DataFrame(career)
+
+        columns = [
+            "date",
+            "season",
+            "team",
+            "opponent",
+            "difficulty",
+            "runs",
+            "grade",
+            "letter",
+            "shutout"
+        ]
+
+        st.dataframe(
+            career_table[columns],
+            hide_index=True,
+            use_container_width=True
+        )
+
+# ==============================================
+# CAREER EXPORT / IMPORT
+# ==============================================
+
+career_data = {
+    "format": "sports-by-the-numbers-career-v1",
+    "manager": (
+        st.session_state.career_manager_name
+    ),
+    "games": career
+}
+
+st.download_button(
+    "💾 SAVE CAREER PROGRESS",
+    data=json.dumps(
+        career_data,
+        indent=2
+    ),
+    file_name="manager_career.json",
+    mime="application/json",
+    key="career_export_button"
+)
+
+with st.expander(
+    "📂 Restore a Saved Career"
+):
+    career_upload = st.file_uploader(
+        "Upload your previously saved career JSON",
+        type=["json"],
+        key="career_import_upload"
+    )
+
+    if (
+        career_upload is not None
+        and st.button(
+            "IMPORT CAREER",
+            key="career_import_button"
+        )
+    ):
+        try:
+            imported = json.loads(
+                career_upload.getvalue().decode(
+                    "utf-8"
+                )
+            )
+
+            if (
+                not isinstance(imported, dict)
+                or imported.get("format")
+                != "sports-by-the-numbers-career-v1"
+            ):
+                raise ValueError(
+                    "Invalid career file format."
+                )
+
+            records = imported.get(
+                "games", []
+            )
+
+            if (
+                not isinstance(records, list)
+                or len(records) > 2000
+            ):
+                raise ValueError(
+                    "Invalid career history."
+                )
+
+            known_ids = {
+                item.get("id")
+                for item in st.session_state.career_games
+            }
+
+            imported_count = 0
+
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+
+                if not record.get("id"):
+                    continue
+
+                if record["id"] in known_ids:
+                    continue
+
+                if not isinstance(
+                    record.get("grade"), (int, float)
+                ):
+                    continue
+
+                st.session_state.career_games.append(
+                    record
+                )
+
+                known_ids.add(record["id"])
+                imported_count += 1
+
+            st.success(
+                f"Imported {imported_count} "
+                "career games."
+            )
+
+            st.rerun()
+
+        except (
+            ValueError,
+            UnicodeError,
+            TypeError,
+            KeyError
+        ) as error:
+            st.error(
+                f"Could not import career: {error}"
+            )
+
+st.caption(
+    "Career history is saved in the current "
+    "Streamlit session. Download your career "
+    "JSON to continue on another day or device."
+)
+
+
+# ==============================================
+# POSTGAME MANAGER REPORT
+# ==============================================
+
+if (
+    current_game is not None
+    and current_game.get("finished")
+):
+
+    st.divider()
+
+    st.markdown(
+        "## 📄 POSTGAME MANAGER REPORT"
+    )
+
+    assessment = career_assessment(
+        current_game
+    )
+
+    st.markdown(
+        f"### Final Manager Grade: "
+        f"{assessment['letter']} "
+        f"({assessment['score']}/100)"
+    )
+
+    grade_rows = []
+
+    for category, points in (
+        assessment["categories"].items()
+    ):
+        grade_rows.append({
+            "Category": category,
+            "Points Earned": points
+        })
+
+    st.dataframe(
+        pd.DataFrame(grade_rows),
+        hide_index=True,
+        use_container_width=True
+    )
+
+    pdf_bytes = build_career_pdf(
+        current_game,
+        st.session_state.career_manager_name
+    )
+
+    st.download_button(
+        "📄 DOWNLOAD POSTGAME PDF + GRADE",
+        data=pdf_bytes,
+        file_name=(
+            f"manager_report_"
+            f"{current_game['year']}_"
+            f"{current_game['career_id'][:8]}.pdf"
+        ),
+        mime="application/pdf",
+        type="primary",
+        key="download_postgame_pdf"
+    )
+
+    st.success(
+        "Your completed game has been "
+        "added to your career history."
+    )
+
+# ==============================================
+# END OF CAREER MANAGER EXTENSION
+# ==============================================
