@@ -295,7 +295,9 @@ def starting_game(data, starter, mode):
       park=data.get('park',park_info(data['team'],data['year'])),
       team_defense=data.get('team_defense',{'rating':5,'source':'Neutral modeled rating'}),
       errors=0,dramatic_alert='',event_history=[],last_inning_ended=None,
-      outfield_assists=0,extra_base_attempts=0,basepath_outs=0,play_field='')
+      outfield_assists=0,extra_base_attempts=0,basepath_outs=0,play_field='',
+      pitching_lines={q['id']:{'outs':0,'hits':0,'walks':0,'runs':0,'strikeouts':0,'batters':0} for q in staff},
+      final_event='',final_out_details='')
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -310,6 +312,53 @@ def pitcher_limit(p, mode):
 
 
 def fatigue(g,p): return g['pitches'][p['id']]/pitcher_limit(p,g['mode'])
+
+
+def fatigue_hit_multiplier(g,p):
+    """Percent rise over baseline hit risk as workload increases.
+
+    Below 35% workload: no penalty. At 100%: +20% relative hit risk.
+    At 130%: +35% relative hit risk (capped at +40%).
+    This classroom model is a tunable assumption, not a measured MLB law.
+    """
+    f=max(0.0,fatigue(g,p))
+    return 1 + min(.40, max(0.0,f-.35)*(.20/.65))
+
+
+def pitching_line(g,pid):
+    return g.setdefault('pitching_lines',{}).setdefault(pid,
+        {'outs':0,'hits':0,'walks':0,'runs':0,'strikeouts':0,'batters':0})
+
+
+def inning_pitching_summary(g):
+    rows=[]
+    for q in g['staff']:
+        pid=q['id']
+        if pid not in g.get('used',[]):continue
+        line=pitching_line(g,pid)
+        outs=line['outs']
+        rows.append({'Pitcher':q['name'],'IP':f"{outs//3}.{outs%3}",
+            'H':line['hits'],'R':line['runs'],'BB':line['walks'],
+            'K':line['strikeouts'],'Pitches':g['pitches'].get(pid,0),
+            'Batters':line['batters']})
+    return rows
+
+
+def key_manager_decisions(g):
+    """Selected evidence, not a causal claim about random outcomes."""
+    selected=[]
+    for row in g.get('decisions',[]):
+        delta=number(row.get('Old risk'))-number(row.get('New risk'))
+        selected.append((abs(delta),f"Inning {row.get('Inning')}: {row.get('Out')} → {row.get('In')} "
+                    f"({row.get('Reason')}); matchup-risk index changed by {delta:+.1f} points."))
+    for item in g.get('strategy_log',[]):
+        if item.get('Approach')=='Intentional walk':
+            selected.append((.5,f"Inning {item.get('Inning')}: intentionally walked {item.get('Batter')}—" 
+                           'discuss the next-hitter matchup.'))
+    for evt in g.get('confidence_events',[]):
+        selected.append((.4,evt))
+    return [v for _,v in sorted(selected,key=lambda x:x[0],reverse=True)[:3]]
+
 def pitcher_confidence(g,p):
     return g.get('confidence',{}).get(p['id'],70)
 
@@ -380,7 +429,7 @@ def estimate(g,p,h,approach='Balanced',defense='Normal'):
     else:
         hand_adjust=-.017 if h['bats']==p['throws'] and h['bats'] in ('L','R') else .010
 
-    tired=max(0,fatigue(g,p)-.65)
+    tired=max(0,fatigue(g,p)-.65)  # retained for modest walk and K rate effects
     pitching_split=observed_pitching_split(p,h['bats'],g['year'])
     if pitching_split and number(pitching_split.get('battersFaced')) >= 1:
         split_bf=max(1,number(pitching_split.get('battersFaced')))
@@ -396,7 +445,8 @@ def estimate(g,p,h,approach='Balanced',defense='Normal'):
     else:
         k_rate=number(ps.get('strikeOuts'))/bf
         bb_rate=number(ps.get('baseOnBalls'))/bf
-    hp=bounded(avg+hand_adjust+(number(ps.get('whip'),1.3)-1.3)*.045+(number(ps.get('era'),4.2)-4.2)*.006+tired*.065,.08,.48)
+    hp=bounded(avg+hand_adjust+(number(ps.get('whip'),1.3)-1.3)*.045+(number(ps.get('era'),4.2)-4.2)*.006,.08,.48)
+    hp*=fatigue_hit_multiplier(g,p)  # 20% relative boost at 100% workload
     wp=bounded(bb_rate+tired*.03,.025,.18)
     kp=bounded(k_rate-tired*.03,.06,.40)
     if approach=='Attack the zone': hp*=1.12;wp*=.70;kp*=1.20
@@ -653,6 +703,8 @@ def after_batter(g):
         g['jam_escaped']=False
     if g['inning']>9:
         g['finished']=True
+        g['final_out_details']=g.get('last_play','Final out recorded.')
+        g['final_event']='SHUTOUT COMPLETE' if g['runs']==0 else 'FINAL OUT — GAME COMPLETE'
         if g['runs']==0 and 'Shutout Legend' not in g['achievements']:
             g['achievements'].append('Shutout Legend')
 
@@ -661,6 +713,7 @@ def intentional_walk(g):
     if g['finished'] or all(g['bases']):return
     g['prior_bases']=g['bases'].copy()
     p=pitcher(g);h=batter(g);g['_plate_hitter']=h;scored=walk_bases(g)
+    line=pitching_line(g,p['id']);line['batters']+=1;line['walks']+=1;line['runs']+=scored
     g['faced'][p['id']]+=1;g['appearance']+=1;g['intentional_walks']+=1
     g['strategy_log'].append(dict(Inning=g['inning'],Batter=h['name'],Pitcher=p['name'],
       Approach='Intentional walk',Defense='—',**{'Hit %':'—','Walk %':100}))
@@ -722,7 +775,16 @@ def simulate(g,approach,defense):
                     action=f'{h["name"]} grounds {location}. {fielder.title()} fields it and throws to first baseman for the putout.'
                 else:
                     action=f'{h["name"]} hits a {"pop-up" if kind=="popup" else "fly ball"} {location}. {fielder.title()} makes the catch for the putout.'
-    pitches=random.randint(4,9) if approach=='Pitch carefully' else random.randint(2,6) if approach=='Attack the zone' else random.randint(3,8)
+    # Credit outs on the basepaths to the active pitcher as a team approximation.
+    recorded_outs=min(3,max(0,g['outs']-outs_before))
+    line=pitching_line(g,p['id'])
+    line['outs']+=recorded_outs
+    line['hits']+=int(result in ('singles','DOUBLES','TRIPLES','HOMERS'))
+    line['walks']+=int(result=='walks')
+    line['runs']+=runs
+    line['strikeouts']+=int(result=='strikes out')
+    line['batters']+=1
+    pitches=random.randint(4,9) if approach=='Pitch carefully'  else random.randint(2,6) if approach=='Attack the zone' else random.randint(3,8)
     g['pitches'][p['id']]+=pitches;g['faced'][p['id']]+=1;g['appearance']+=1
     update_confidence(g,p,result,runs)
     g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT','reaches on a fielding ERROR':'ERROR'}.get(result,'OUT')
@@ -1002,7 +1064,8 @@ def career_record(g, name):
         'achievements':list(g.get('achievements',[])),
         'pitching_changes':len(g.get('decisions',[])),
         'strategies':len(g.get('strategy_log',[])),
-        'scouting':g.get('scouting',{}),'mound_visits_used':5-g.get('mound_visits',5)
+        'scouting':g.get('scouting',{}),'mound_visits_used':5-g.get('mound_visits',5),
+        'pitching_box':inning_pitching_summary(g),'key_decisions':key_manager_decisions(g)
     }
 
 
@@ -1069,6 +1132,22 @@ def make_game_pdf(g, name):
         story.append(Paragraph(f"Mound visits used: {5-g.get('mound_visits',5)}",styles['SmallCustom']))
     story.append(Paragraph('Ballpark and defense',styles['SubtitleCustom']))
     story.append(Paragraph('Park: '+pdf_escape(g.get('park',{}).get('name','Unknown'))+' | Defensive rating: '+str(g.get('team_defense',{}).get('rating',5))+'/10 | Errors: '+str(g.get('errors',0)),styles['SmallCustom']))
+    story.append(Paragraph('Pitching box score',styles['SubtitleCustom']))
+    pitch_rows=[['Pitcher','IP','H','R','BB','K','Pit']]
+    for row in inning_pitching_summary(g):
+        pitch_rows.append([pdf_escape(row['Pitcher'][:23]),row['IP'],str(row['H']),
+                           str(row['R']),str(row['BB']),str(row['K']),str(row['Pitches'])])
+    pt=Table(pitch_rows,colWidths=[233,37,37,37,37,37,42],hAlign='LEFT')
+    pt.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E7EEF2')),
+      ('GRID',(0,0),(-1,-1),.25,colors.HexColor('#C9D3DB')),
+      ('FONTSIZE',(0,0),(-1,-1),8),('TOPPADDING',(0,0),(-1,-1),4),
+      ('BOTTOMPADDING',(0,0),(-1,-1),4)]))
+    story.append(pt)
+    story.append(Paragraph('Three important managerial decisions',styles['SubtitleCustom']))
+    for event in key_manager_decisions(g):story.append(Paragraph('• '+pdf_escape(event),styles['SmallCustom']))
+    story.append(Paragraph('Fatigue and risk',styles['SubtitleCustom']))
+    story.append(Paragraph('Hit likelihood rises with workload: +20% relative risk at 100% fatigue, '
+      'up to +40% beyond the usual pitch limit. This is a simulation assumption, not a measured MLB rate.',styles['SmallCustom']))
     story += [Paragraph('Game statistics',styles['SubtitleCustom']),
               Paragraph(f"Hits allowed: <b>{g['hits']}</b> | Strikeouts: <b>{g['strikeouts']}</b> | "
                         f"Double plays: <b>{g['double_plays']}</b> | Intentional walks: <b>{g['intentional_walks']}</b> | "
@@ -1121,7 +1200,7 @@ def safe_career_import(raw):
     return clean_manager_name(data.get('manager','Manager')),cleaned
 
 
-st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.4")
+st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.5")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
@@ -1264,6 +1343,7 @@ if g:
         st.markdown(f"**{escape(p['name'])}** · {throwing(p['throws'])} · {p['role']}")
         st.caption(f"ON MOUND · ERA {p['stats'].get('era','—')} · WHIP {p['stats'].get('whip','—')}")
         st.progress(bounded(fatigue(g,p),0,1),text=f"Fatigue {fatigue(g,p):.0%}")
+        st.caption(f"📈 Fatigue hit-risk adjustment: **+{(fatigue_hit_multiplier(g,p)-1)*100:.1f}%** relative to fresh-pitcher risk (modeled)")
         st.progress(pitcher_confidence(g,p)/100,text=f"Confidence {pitcher_confidence(g,p)} / 100 (simulated)")
         if not g['finished']:
             if st.button(f"🧢 MOUND VISIT · {g.get('mound_visits',5)} left",key='side_mound_visit',
@@ -1356,6 +1436,16 @@ if g:
             st.caption('Select a reliever for a quick comparison.')
         st.caption('Modeled estimates; not MLB forecasts.')
         st.caption(f"🎯 Outfield assists: {g.get('outfield_assists',0)} / {g.get('extra_base_attempts',0)} contested extra-base tries · 4% baseline per try")
+    if g['finished']:
+        st.markdown(f"""<div style="background:linear-gradient(105deg,#12344b,#205849);padding:20px;
+          border:2px solid #eeb25a;border-radius:15px;color:white;text-align:center;margin:14px 0">
+          <div style="font:800 13px Arial;letter-spacing:2px;color:#f9cd85">FINAL · NINE INNINGS</div>
+          <div style="font:900 clamp(26px,4vw,43px) Arial;margin:6px 0">{'🏆 SHUTOUT COMPLETE!' if g['runs']==0 else '⚾ GAME COMPLETE'}</div>
+          <div style="font:700 18px Arial">{g['runs']} runs · {g['hits']} hits · {g['strikeouts']} strikeouts</div>
+          <div style="font:700 17px Arial;color:#ffd591">MANAGER GRADE {manager_assessment(g)['letter']} · {manager_assessment(g)['score']}/100</div>
+          <div style="font:14px Arial;margin-top:8px">{escape(g.get('final_out_details','Final out recorded.'))}</div>
+          </div>""",unsafe_allow_html=True)
+        st.caption('Final event and score remain visible. Use Manager Report below for the box score and PDF.')
     # Only optional, nonessential details below the main game.
     history_tab,scout_tab,lab_tab,report_tab=st.tabs(['📻 Play-by-play','🔍 Historical splits','📊 Full Matchup Lab','🏆 Manager Report'])
     with history_tab:
@@ -1385,6 +1475,13 @@ if g:
             st.caption('Lower risk proxy is better in this educational model; it is not probability of runs.')
     with report_tab:
         assessment=manager_assessment(g)
+        if g['finished']:
+            st.markdown('### 📋 Final pitching box score')
+            st.dataframe(pd.DataFrame(inning_pitching_summary(g)),hide_index=True,use_container_width=True)
+            st.markdown('#### Three key manager decisions')
+            for entry in key_manager_decisions(g):st.write('• '+entry)
+            if not key_manager_decisions(g):st.caption('No special substitutions or mound visits recorded.')
+            st.caption('Pitching runs are assigned to the pitcher on the mound when scoring occurs; inherited-runner accounting is approximated.')
         st.metric('MANAGER GRADE',f"{assessment['letter']} · {assessment['score']}/100")
         st.caption('Rubric: engagement 20, bullpen decisions 30, situational strategy 30, run prevention 20. Outcomes have only 20% weight.')
         st.dataframe(pd.DataFrame([{'Category':k,'Points':v} for k,v in assessment['parts'].items()]),hide_index=True,use_container_width=True)
