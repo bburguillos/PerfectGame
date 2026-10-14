@@ -297,7 +297,7 @@ def starting_game(data, starter, mode):
       errors=0,dramatic_alert='',event_history=[],last_inning_ended=None,
       outfield_assists=0,extra_base_attempts=0,basepath_outs=0,play_field='',
       pitching_lines={q['id']:{'outs':0,'hits':0,'walks':0,'runs':0,'strikeouts':0,'batters':0} for q in staff},
-      final_event='',final_out_details='')
+      final_event='',final_out_details='',batting_lines={},batting_order=[])
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -682,6 +682,44 @@ def walk_bases(g):
     return score
 
 
+def record_batting_result(g, h, result, scored=0):
+    """Record simulated offensive box score, including replacement pinch hitters."""
+    key=str(h['id'])
+    lines=g.setdefault('batting_lines',{})
+    order=g.setdefault('batting_order',[])
+    if key not in lines:
+        lines[key]={'Player':h['name'],'PA':0,'AB':0,'H':0,'2B':0,'3B':0,'HR':0,
+                    'RBI':0,'BB':0,'K':0,'SF':0,'E':0}
+        order.append(key)
+    row=lines[key]
+    row['PA']+=1
+    hit_bases={'singles':1,'DOUBLES':2,'TRIPLES':3,'HOMERS':4}
+    if result in hit_bases:
+        row['AB']+=1
+        row['H']+=1
+        if hit_bases[result]==2: row['2B']+=1
+        if hit_bases[result]==3: row['3B']+=1
+        if hit_bases[result]==4: row['HR']+=1
+        row['RBI']+=scored
+    elif result in ('walks','intentional walk'):
+        row['BB']+=1
+        # Bases-loaded walk earns a run batted in.
+        row['RBI']+=scored
+    elif result=='hits a sacrifice fly':
+        row['SF']+=1
+        row['RBI']+=scored
+    else:
+        row['AB']+=1
+        if result=='strikes out': row['K']+=1
+        if result=='reaches on a fielding ERROR': row['E']+=1
+
+
+def batting_box_score(g):
+    """Return rows ordered by first appearance, including bench substitutions."""
+    lines=g.get('batting_lines',{})
+    return [dict(lines[key]) for key in g.get('batting_order',[]) if key in lines]
+
+
 def after_batter(g):
     g['spot']+=1;warm_tick(g)
     g['play_serial']+=1
@@ -718,6 +756,7 @@ def intentional_walk(g):
     g['strategy_log'].append(dict(Inning=g['inning'],Batter=h['name'],Pitcher=p['name'],
       Approach='Intentional walk',Defense='—',**{'Hit %':'—','Walk %':100}))
     g['play_result']='INTENTIONAL WALK';g['play_detail']=f"{h['name']} takes first base";g['play_runs']=scored
+    record_batting_result(g,h,'intentional walk',scored)
     g['last_play']=f"{p['name']} intentionally walks {h['name']}."+(' A run scores!' if scored else '')
     g['log'].append(g['last_play']);after_batter(g)
 
@@ -775,6 +814,7 @@ def simulate(g,approach,defense):
                     action=f'{h["name"]} grounds {location}. {fielder.title()} fields it and throws to first baseman for the putout.'
                 else:
                     action=f'{h["name"]} hits a {"pop-up" if kind=="popup" else "fly ball"} {location}. {fielder.title()} makes the catch for the putout.'
+    record_batting_result(g,h,result,runs)
     # Credit outs on the basepaths to the active pitcher as a team approximation.
     recorded_outs=min(3,max(0,g['outs']-outs_before))
     line=pitching_line(g,p['id'])
@@ -1143,6 +1183,18 @@ def make_game_pdf(g, name):
       ('FONTSIZE',(0,0),(-1,-1),8),('TOPPADDING',(0,0),(-1,-1),4),
       ('BOTTOMPADDING',(0,0),(-1,-1),4)]))
     story.append(pt)
+    story.append(Paragraph('Opposing hitter box score',styles['SubtitleCustom']))
+    hitting=[['Batter','PA','AB','H','2B','3B','HR','BB','K','RBI']]
+    for row in batting_box_score(g):
+        hitting.append([pdf_escape(str(row['Player'])[:21])]+[str(row[k]) for k in ('PA','AB','H','2B','3B','HR','BB','K','RBI')])
+    if len(hitting)>1:
+        hitter_table=Table(hitting,colWidths=[184,35,35,35,35,35,35,35,35,42],hAlign='LEFT',repeatRows=1)
+        hitter_table.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E7EEF2')),
+            ('GRID',(0,0),(-1,-1),.25,colors.HexColor('#C9D3DB')),
+            ('FONTSIZE',(0,0),(-1,-1),7),('TOPPADDING',(0,0),(-1,-1),3),
+            ('BOTTOMPADDING',(0,0),(-1,-1),3)]))
+        story.append(hitter_table)
+        story.append(Paragraph('AB excludes walks and sacrifice flies. RBI reflects simulated runners scoring on the play.',styles['SmallCustom']))
     story.append(Paragraph('Three important managerial decisions',styles['SubtitleCustom']))
     for event in key_manager_decisions(g):story.append(Paragraph('• '+pdf_escape(event),styles['SmallCustom']))
     story.append(Paragraph('Fatigue and risk',styles['SubtitleCustom']))
@@ -1437,15 +1489,65 @@ if g:
         st.caption('Modeled estimates; not MLB forecasts.')
         st.caption(f"🎯 Outfield assists: {g.get('outfield_assists',0)} / {g.get('extra_base_attempts',0)} contested extra-base tries · 4% baseline per try")
     if g['finished']:
-        st.markdown(f"""<div style="background:linear-gradient(105deg,#12344b,#205849);padding:20px;
-          border:2px solid #eeb25a;border-radius:15px;color:white;text-align:center;margin:14px 0">
-          <div style="font:800 13px Arial;letter-spacing:2px;color:#f9cd85">FINAL · NINE INNINGS</div>
-          <div style="font:900 clamp(26px,4vw,43px) Arial;margin:6px 0">{'🏆 SHUTOUT COMPLETE!' if g['runs']==0 else '⚾ GAME COMPLETE'}</div>
-          <div style="font:700 18px Arial">{g['runs']} runs · {g['hits']} hits · {g['strikeouts']} strikeouts</div>
-          <div style="font:700 17px Arial;color:#ffd591">MANAGER GRADE {manager_assessment(g)['letter']} · {manager_assessment(g)['score']}/100</div>
-          <div style="font:14px Arial;margin-top:8px">{escape(g.get('final_out_details','Final out recorded.'))}</div>
-          </div>""",unsafe_allow_html=True)
-        st.caption('Final event and score remain visible. Use Manager Report below for the box score and PDF.')
+        # Final broadcast appears before all optional tabs: no hidden box score.
+        assessment = manager_assessment(g)
+        shutout = (g['runs'] == 0)
+        headline = 'SHUTOUT COMPLETE!' if shutout else 'FINAL — GAME COMPLETE'
+        subhead = 'NINE SCORELESS INNINGS' if shutout else 'NINE INNINGS IN THE BOOKS'
+        st.markdown(f"""<div style="background:linear-gradient(115deg,#091b2c,#16445a 60%,#18604b);border:2px solid #efb44e;
+           border-radius:18px;padding:22px 24px;color:#fff;text-align:center;margin:16px 0 9px;
+           box-shadow:0 8px 24px rgba(0,0,0,.23)">
+           <div style="font:800 12px Arial;letter-spacing:3px;color:#ffd18a">SPORTS BY THE NUMBERS · FINAL</div>
+           <div style="font:900 clamp(28px,4vw,48px) Arial;margin:9px 0 3px">{headline}</div>
+           <div style="font:700 12px Arial;letter-spacing:2px;color:#cbe9e6">{subhead}</div>
+           <div style="font:700 15px Arial;margin:13px auto 3px;max-width:830px">{escape(g.get('final_out_details','Final out recorded.'))}</div>
+           </div>""",unsafe_allow_html=True)
+        final_a, final_b, final_c, final_d = st.columns(4)
+        final_a.metric('RUNS ALLOWED',g['runs'])
+        final_b.metric('HITS ALLOWED',g['hits'])
+        final_c.metric('STRIKEOUTS',g['strikeouts'])
+        final_d.metric('MANAGER GRADE',f"{assessment['letter']} · {assessment['score']}/100")
+
+        st.markdown('### 📋 OFFICIAL PITCHING BOX SCORE')
+        pitch_rows = inning_pitching_summary(g)
+        if pitch_rows:
+            st.dataframe(pd.DataFrame(pitch_rows),hide_index=True,use_container_width=True)
+            totals = {'Pitcher':'TEAM TOTAL','IP':f"{sum(pitching_line(g,q['id'])['outs'] for q in g['staff'] if q['id'] in g.get('used',[]))//3}.{sum(pitching_line(g,q['id'])['outs'] for q in g['staff'] if q['id'] in g.get('used',[]))%3}",
+                'H':sum(r['H'] for r in pitch_rows),'R':sum(r['R'] for r in pitch_rows),
+                'BB':sum(r['BB'] for r in pitch_rows),'K':sum(r['K'] for r in pitch_rows),
+                'Pitches':sum(r['Pitches'] for r in pitch_rows),'Batters':sum(r['Batters'] for r in pitch_rows)}
+            st.caption(f"Team totals: {totals['IP']} IP · {totals['H']} H · {totals['R']} R · {totals['BB']} BB · {totals['K']} K · {totals['Pitches']} pitches")
+            st.caption('Pitcher runs are assigned when a runner scores; inherited-runner responsibility is approximated. IP counts recorded outs, including runner outs.')
+        else:
+            st.warning('No individual pitching lines were recorded for this game.')
+
+        st.markdown('### ⚾ OFFICIAL HITTER BOX SCORE · OPPOSING LINEUP')
+        batter_rows=batting_box_score(g)
+        if batter_rows:
+            st.dataframe(pd.DataFrame(batter_rows),hide_index=True,use_container_width=True)
+            st.caption('PA = plate appearances · AB excludes walks and sacrifice flies · 2B/3B/HR = extra-base hits · RBI = runs batted in. Pinch hitters are listed separately.')
+        else:
+            st.warning('This game was created before individual hitter statistics were recorded. Start a new game to generate a hitter box score.')
+
+        moment_col, review_col=st.columns([1.25,1],gap='large')
+        with moment_col:
+            st.markdown('#### 🎙️ GAME-CHANGING MOMENTS')
+            moments=list(g.get('event_history',[]))[-4:]
+            if not moments: moments=list(g.get('highlights',[]))[-4:]
+            if moments:
+                for evt in reversed(moments):st.markdown('⚾ '+str(evt))
+            else: st.caption('No special broadcast moments were recorded this game.')
+        with review_col:
+            st.markdown("#### 🧢 THE MANAGER’S DECISIONS")
+            decisions=key_manager_decisions(g)
+            if decisions:
+                for item in decisions[:3]: st.write('• '+str(item))
+            else: st.caption('No special substitutions or mound visits recorded.')
+        st.caption('The complete manager rubric, historical details, and printable report are available in the Manager Report tab below.')
+        st.download_button('📄 DOWNLOAD OFFICIAL POSTGAME PDF',
+            data=make_game_pdf(g,st.session_state.career_name),
+            file_name=f"manager_report_{g['year']}_{g['career_id'][:8]}.pdf",
+            mime='application/pdf',key='game_pdf_final',type='primary')
     # Only optional, nonessential details below the main game.
     history_tab,scout_tab,lab_tab,report_tab=st.tabs(['📻 Play-by-play','🔍 Historical splits','📊 Full Matchup Lab','🏆 Manager Report'])
     with history_tab:
@@ -1476,8 +1578,7 @@ if g:
     with report_tab:
         assessment=manager_assessment(g)
         if g['finished']:
-            st.markdown('### 📋 Final pitching box score')
-            st.dataframe(pd.DataFrame(inning_pitching_summary(g)),hide_index=True,use_container_width=True)
+            st.caption('Official pitching and hitter box scores appear above these tabs after the final out.')
             st.markdown('#### Three key manager decisions')
             for entry in key_manager_decisions(g):st.write('• '+entry)
             if not key_manager_decisions(g):st.caption('No special substitutions or mound visits recorded.')
