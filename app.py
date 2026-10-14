@@ -287,7 +287,7 @@ def starting_game(data, starter, mode):
       hits=0,walks=0,bases=[False]*3,spot=0,finished=False,mode=mode,
       log=['PLAY BALL!'],decisions=[],strategy_log=[],strikeouts=0,double_plays=0,
       intentional_walks=0,last_play='Game begins!',play_result='',play_detail='',play_runs=0,
-      prior_bases=[False]*3,play_serial=0,highlights=[],achievements=[],
+      prior_bases=[False]*3,base_runners=[None]*3,runner_note='',opponent_moves=[],play_serial=0,highlights=[],achievements=[],
       inning_start_runs=0,inning_reliever=False,jam_escaped=False,
       relief_scoreless=0,relief_inning_outs=0,career_id=str(uuid4()),career_saved=False,
       scouting=data.get('scouting',{}),confidence={x['id']:70 for x in staff},
@@ -458,49 +458,143 @@ def bring_in(g,pid,reason):
         g['achievements'].append('Matchup Master')
 
 
+def runner_speed(h):
+    """Classroom proxy from historical stolen-base totals, not actual sprint speed."""
+    if not h:
+        return .50
+    stats=h.get('stats',{})
+    sb=number(stats.get('stolenBases'))
+    cs=number(stats.get('caughtStealing'))
+    attempts=sb+cs
+    # Small speed boost for frequent, successful base stealers; regress to neutral.
+    rate=(sb+3)/(attempts+6)
+    return bounded(.36 + min(sb,45)/110 + (rate-.65)*.12, .30, .85)
+
+
+def lineup_runner(g,base_index):
+    # Track actual runner identities when possible. Existing saved games still work.
+    identities=g.setdefault('base_runners',[None,None,None])
+    return identities[base_index]
+
+
 def pinch_hit(g):
-    if g['inning']<7 or not g['bench'] or not (any(g['bases']) or g['inning']>=8):return
-    ix=g['spot']%9; old=g['lineup'][ix]; current=pitcher(g)
-    replacement=min(g['bench'],key=lambda h:estimate(g,current,h)[0]*-1)
-    if estimate(g,current,replacement)[0]>estimate(g,current,old)[0]+.035:
-        g['lineup'][ix]=replacement;g['bench'].remove(replacement)
-        g['log'].append(f"📣 PINCH HITTER: {replacement['name']} replaces {old['name']}!")
+    """Computer uses bench only when leverage and matchup justify the permanent swap."""
+    if g['inning']<7 or not g['bench']:
+        return
+    ix=g['spot']%9
+    old=g['lineup'][ix]
+    current=pitcher(g)
+    runners=sum(bool(x) for x in g['bases'])
+    scoring=g['bases'][1] or g['bases'][2]
+    leverage=(g['inning']>=8 and (runners>0 or g['outs']<2)) or scoring
+    if not leverage:
+        return
+    # Current season batting model + matchup, rewarding reaching base and contact.
+    def value(h):
+        hit,walk,k=estimate(g,current,h)
+        stats=h['stats']; ab=max(1,number(stats.get('atBats')))
+        extra=(number(stats.get('doubles'))+2*number(stats.get('triples'))+3*number(stats.get('homeRuns')))/ab
+        return hit*(1+.55*extra)+walk*.55-k*.12
+    old_value=value(old)
+    replacement=max(g['bench'],key=value)
+    gain=value(replacement)-old_value
+    # Preserve bench for more important later moments; no gratuitous changes.
+    required=.038 if g['inning']==7 else .028 if g['inning']==8 else .018
+    if not scoring:
+        required+=.012
+    if gain>=required:
+        g['lineup'][ix]=replacement
+        g['bench'].remove(replacement)
+        g.setdefault('opponent_moves',[]).append({
+            'inning':g['inning'],'outs':g['outs'],
+            'move':'Pinch hitter','in':replacement['name'],'out':old['name'],
+            'reason':f'Projected matchup improvement {gain:+.3f}; {runners} runner(s) aboard.'})
+        g['log'].append(f"📣 OPPOSING MANAGER: {replacement['name']} pinch hits for {old['name']} — favorable matchup with {runners} runners aboard.")
 
 
-def advance_hit(g,distance):
-    old=g['bases'];new=[False]*3;runs=0
-    if distance==4:runs=1+sum(old)
-    else:
-        # Process lead runners first; use a conservative fallback if a base is occupied.
-        for i in (2,1,0):
-            if not old[i]:continue
-            advance=distance
-            if distance==1 and i==1 and random.random()<(.72 if g['outs']==2 else .50): advance=2
-            if distance==1 and i==0 and random.random()<.23: advance=2
-            dest=i+advance
-            if dest>=3:runs+=1
+def advance_hit(g,distance,hitter=None):
+    """Advance runners with occupancy checks and context-sensitive extra bases.
+
+    Records who occupies each base. Historical stolen-base statistics provide a
+    conservative speed proxy; defense and outs affect optional extra bases.
+    """
+    old=g['bases'][:]
+    runners=g.setdefault('base_runners',[None,None,None])[:]
+    if not any(runners) and any(old):
+        runners=[{'name':'Runner','stats':{}} if occupied else None for occupied in old]
+    runs=0
+    new=[False,False,False]
+    new_runners=[None,None,None]
+    notes=[]
+    if distance==4:
+        runs=1+sum(old)
+        g['bases']=new;g['base_runners']=new_runners;g['runs']+=runs
+        g['runner_note']='All runners score on the home run.'
+        return runs
+    if distance==3:
+        runs=sum(old)
+        new[2]=True;new_runners[2]=hitter
+        g['bases']=new;g['base_runners']=new_runners;g['runs']+=runs
+        g['runner_note']='All existing runners score on the triple.' if runs else ''
+        return runs
+    outs=g['outs']
+    field_rating=number(g.get('team_defense',{}).get('rating'),5)
+    for i in (2,1,0):
+        if not old[i]:
+            continue
+        runner=runners[i]
+        speed=runner_speed(runner)
+        if distance==2:
+            # Runner on first can score on a double, especially with two outs.
+            if i==0:
+                chance=bounded(.31 + .35*speed + (.16 if outs==2 else 0) - .018*(field_rating-5),.20,.83)
+                dest=3 if random.random()<chance else 2
+                if dest==3: notes.append('Runner scores from first on the double!')
+                else: notes.append('Runner advances from first to third.')
             else:
-                while dest<3 and new[dest]:dest+=1
-                if dest>=3:runs+=1
-                else:new[dest]=True
-        new[distance-1]=True
-    g['bases']=new;g['runs']+=runs;return runs
+                dest=3
+        else:
+            # Singles: runners on second often score; runner at first may go to third.
+            if i==2:
+                dest=3
+            elif i==1:
+                chance=bounded(.35 + .45*speed + (.16 if outs==2 else 0) - .02*(field_rating-5),.25,.92)
+                dest=3 if random.random()<chance else 2
+                if dest==3: notes.append('Runner scores from second!')
+                else: notes.append('Runner holds at third.')
+            else:
+                chance=bounded(.08 + .40*speed + (.11 if outs==2 else 0) - .018*(field_rating-5),.07,.60)
+                dest=2 if random.random()<chance else 1
+                if dest==2: notes.append('Runner takes third from first!')
+        # Occupancy check: never place two runners on the same base. A trailing
+        # runner must stop behind the leading runner (rather than teleport home).
+        if dest>=3:
+            runs+=1
+        else:
+            while dest>=0 and new[dest]:
+                dest-=1
+            if dest<0:
+                # This should not occur on the supported hit types.
+                dest=i+1
+            if dest>=3: runs+=1
+            else:
+                new[dest]=True;new_runners[dest]=runner
+    new[distance-1]=True
+    new_runners[distance-1]=hitter
+    g['bases']=new
+    g['base_runners']=new_runners
+    g['runs']+=runs
+    g['runner_note']=' '.join(notes)
+    return runs
 
 
 def walk_bases(g):
-    park=g.get('park',{})
-    shape=park.get('shape','balanced')
-    fence={
-        'fenway':'M0 93 L98 27 Q295 -15 550 70',
-        'short_right':'M0 73 Q240 -8 550 110',
-        'short_left':'M0 110 Q310 -8 550 73',
-        'wide':'M0 65 Q275 -45 550 65',
-        'deep_right':'M0 85 Q340 -44 550 65',
-        'deep_left':'M0 65 Q225 -44 550 85',
-        'balanced':'M0 75 Q275 -18 550 75',
-    }.get(shape,'M0 75 Q275 -18 550 75')
     a,b,c=g['bases'];score=int(a and b and c)
+    oldr=g.setdefault('base_runners',[None,None,None])[:]
+    entering=g.get('_plate_hitter')
+    g['base_runners']=[entering,oldr[0] if a else oldr[1],oldr[2] if c else oldr[1] if (a and b) else None]
     g['bases']=[True,a or b,c or (a and b)];g['runs']+=score;g['walks']+=1
+    g['runner_note']='Bases loaded walk forces in a run.' if score else ''
     return score
 
 
@@ -520,7 +614,7 @@ def after_batter(g):
                 g['achievements'].append('Bullpen Lockdown')
         elif g['runs']>g['inning_start_runs']:
             g['relief_scoreless']=0
-        g['outs']=0;g['bases']=[False]*3;g['inning']+=1
+        g['outs']=0;g['bases']=[False]*3;g['base_runners']=[None]*3;g['inning']+=1
         g['inning_start_runs']=g['runs'];g['inning_reliever']=(pitcher(g)['role']=='RP')
         g['jam_escaped']=False
     if g['inning']>9:
@@ -532,7 +626,7 @@ def after_batter(g):
 def intentional_walk(g):
     if g['finished'] or all(g['bases']):return
     g['prior_bases']=g['bases'].copy()
-    p=pitcher(g);h=batter(g);scored=walk_bases(g)
+    p=pitcher(g);h=batter(g);g['_plate_hitter']=h;scored=walk_bases(g)
     g['faced'][p['id']]+=1;g['appearance']+=1;g['intentional_walks']+=1
     g['strategy_log'].append(dict(Inning=g['inning'],Batter=h['name'],Pitcher=p['name'],
       Approach='Intentional walk',Defense='—',**{'Hit %':'—','Walk %':100}))
@@ -545,6 +639,7 @@ def simulate(g,approach,defense):
     if g['finished']:return
     g['prior_bases']=g['bases'].copy()
     pinch_hit(g);p=pitcher(g);h=batter(g)
+    g['_plate_hitter']=h;g['runner_note']=''
     if (g['bases'][1] or g['bases'][2]) and g['outs']<=2:
         g['jam_escaped']=True
     hp,wp,kp=estimate(g,p,h,approach,defense)
@@ -555,20 +650,20 @@ def simulate(g,approach,defense):
     if roll<wp:runs=walk_bases(g);result='walks'
     elif roll<wp+hp:
         _,weights=batter_hit_rates(h);distance=random.choices([1,2,3,4],weights=weights,k=1)[0]
-        runs=advance_hit(g,distance);g['hits']+=1
+        runs=advance_hit(g,distance,h);g['hits']+=1
         result={1:'singles',2:'DOUBLES',3:'TRIPLES',4:'HOMERS'}[distance]
     elif roll<wp+hp+kp:g['outs']+=1;g['strikeouts']+=1;result='strikes out'
     else:
         if g['bases'][0] and g['outs']<2 and random.random()<(.27 if defense=='Double-play depth' else .11 if defense=='Infield in' else .16):
-            g['outs']+=2;g['double_plays']+=1;g['bases'][0]=False;result='grounds into a DOUBLE PLAY'
+            g['outs']+=2;g['double_plays']+=1;g['bases'][0]=False;g.setdefault('base_runners',[None,None,None])[0]=None;result='grounds into a DOUBLE PLAY'
         elif g['bases'][2] and g['outs']<2 and random.random()<(.04 if defense=='Infield in' else .17):
-            g['outs']+=1;g['bases'][2]=False;g['runs']+=1;runs=1;result='hits a sacrifice fly'
+            g['outs']+=1;g['bases'][2]=False;g.setdefault('base_runners',[None,None,None])[2]=None;g['runs']+=1;runs=1;result='hits a sacrifice fly'
         else:
             # Defensive errors are separate from credited hits.
             field_rating=number(g.get('team_defense',{}).get('rating'),5)
             error_chance=bounded(.018+(5-field_rating)*.004,.005,.045)
             if random.random()<error_chance:
-                runs=advance_hit(g,1)
+                runs=advance_hit(g,1,h)
                 g['errors']=g.get('errors',0)+1
                 result='reaches on a fielding ERROR'
             else:
@@ -578,8 +673,8 @@ def simulate(g,approach,defense):
     g['pitches'][p['id']]+=pitches;g['faced'][p['id']]+=1;g['appearance']+=1
     update_confidence(g,p,result,runs)
     g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT','reaches on a fielding ERROR':'ERROR'}.get(result,'OUT')
-    g['play_detail']=f"{h['name']} vs. {p['name']}";g['play_runs']=runs
-    g['last_play']=f"Inning {g['inning']}: {h['name']} {result} vs. {p['name']} ({pitches} pitches)."+(f' {runs} run(s) score!' if runs else '')
+    g['play_detail']=f"{h['name']} vs. {p['name']}"+(f" · {g['runner_note']}" if g.get('runner_note') else '');g['play_runs']=runs
+    g['last_play']=f"Inning {g['inning']}: {h['name']} {result} vs. {p['name']} ({pitches} pitches)."+(f' {runs} run(s) score!' if runs else '')+((' '+g.get('runner_note','')) if g.get('runner_note') else '')
     g['log'].append(g['last_play'])
     if g['play_result'] in ('HOME RUN!','TRIPLE','DOUBLE','STRIKEOUT','DOUBLE PLAY'):
         g['highlights'].append(g['last_play'])
