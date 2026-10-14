@@ -294,7 +294,8 @@ def starting_game(data, starter, mode):
       mound_visits=5,visit_boost={x['id']:0 for x in staff},confidence_events=[],
       park=data.get('park',park_info(data['team'],data['year'])),
       team_defense=data.get('team_defense',{'rating':5,'source':'Neutral modeled rating'}),
-      errors=0,dramatic_alert='',event_history=[],last_inning_ended=None)
+      errors=0,dramatic_alert='',event_history=[],last_inning_ended=None,
+      outfield_assists=0,extra_base_attempts=0,basepath_outs=0,play_field='')
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -512,20 +513,52 @@ def pinch_hit(g):
         g['log'].append(f"📣 OPPOSING MANAGER: {replacement['name']} pinch hits for {old['name']} — favorable matchup with {runners} runners aboard.")
 
 
-def advance_hit(g,distance,hitter=None):
-    """Advance runners with occupancy checks and context-sensitive extra bases.
+OUTFIELD_ASSIST_RATE = 0.04  # Classroom assumption PER contested extra-base try, not every hit.
 
-    Records who occupies each base. Historical stolen-base statistics provide a
-    conservative speed proxy; defense and outs affect optional extra bases.
+
+def ball_location(distance, result_kind='hit'):
+    """Simulated directions, NOT recorded historical hit locations."""
+    if result_kind=='ground':
+        return random.choice([('toward third base','third baseman'),('to shortstop','shortstop'),
+                              ('toward second base','second baseman'),('to first base','first baseman'),
+                              ('back to the mound','pitcher')])
+    if result_kind=='popup':
+        return random.choice([('behind second base','second baseman'),('in foul territory near first','first baseman'),
+                              ('near the third-base dugout','third baseman'),('shallow center field','center fielder')])
+    if result_kind=='fly':
+        return random.choice([('deep left field','left fielder'),('left-center field','center fielder'),
+                              ('deep center field','center fielder'),('right-center field','right fielder'),
+                              ('deep right field','right fielder')])
+    places=[('down the left-field line','left fielder'),('into left field','left fielder'),
+            ('to left-center field','center fielder'),('up the middle into center','center fielder'),
+            ('to right-center field','right fielder'),('into right field','right fielder'),
+            ('down the right-field line','right fielder')]
+    if distance==4: return random.choice(places)
+    if distance==3: return random.choice(places[1:5])
+    return random.choice(places)
+
+
+def assist_probability(g,runner,field_position):
+    """4% baseline for each attempt; modest speed/defense adjustments."""
+    speed=runner_speed(runner)
+    rating=number(g.get('team_defense',{}).get('rating'),5)
+    adjustment=(1+.045*(rating-5))*(1+.4*(.5-speed))
+    return bounded(OUTFIELD_ASSIST_RATE*adjustment,.015,.075)
+
+
+def advance_hit(g,distance,hitter=None,location=None,thrower=None):
+    """Process leading runners first; allow realistic, risky extra-base tries.
+
+    An outfielder gets an assist on approximately 4% of extra-base attempts,
+    using the teacher's assumption. An assist produces a real baserunning out.
+    All outcomes are illustrative simulations, not historical play-by-play.
     """
     old=g['bases'][:]
     runners=g.setdefault('base_runners',[None,None,None])[:]
     if not any(runners) and any(old):
         runners=[{'name':'Runner','stats':{}} if occupied else None for occupied in old]
-    runs=0
-    new=[False,False,False]
-    new_runners=[None,None,None]
-    notes=[]
+    new=[False,False,False]; new_runners=[None,None,None]
+    runs=0; notes=[]
     if distance==4:
         runs=1+sum(old)
         g['bases']=new;g['base_runners']=new_runners;g['runs']+=runs
@@ -537,53 +570,54 @@ def advance_hit(g,distance,hitter=None):
         g['bases']=new;g['base_runners']=new_runners;g['runs']+=runs
         g['runner_note']='All existing runners score on the triple.' if runs else ''
         return runs
-    outs=g['outs']
-    field_rating=number(g.get('team_defense',{}).get('rating'),5)
+    outs=g['outs']; field_rating=number(g.get('team_defense',{}).get('rating'),5)
+    thrower=thrower or 'outfielder'
     for i in (2,1,0):
-        if not old[i]:
-            continue
-        runner=runners[i]
-        speed=runner_speed(runner)
-        if distance==2:
-            # Runner on first can score on a double, especially with two outs.
-            if i==0:
-                chance=bounded(.31 + .35*speed + (.16 if outs==2 else 0) - .018*(field_rating-5),.20,.83)
-                dest=3 if random.random()<chance else 2
-                if dest==3: notes.append('Runner scores from first on the double!')
-                else: notes.append('Runner advances from first to third.')
-            else:
-                dest=3
-        else:
-            # Singles: runners on second often score; runner at first may go to third.
-            if i==2:
-                dest=3
-            elif i==1:
-                chance=bounded(.35 + .45*speed + (.16 if outs==2 else 0) - .02*(field_rating-5),.25,.92)
-                dest=3 if random.random()<chance else 2
-                if dest==3: notes.append('Runner scores from second!')
-                else: notes.append('Runner holds at third.')
-            else:
-                chance=bounded(.08 + .40*speed + (.11 if outs==2 else 0) - .018*(field_rating-5),.07,.60)
-                dest=2 if random.random()<chance else 1
-                if dest==2: notes.append('Runner takes third from first!')
-        # Occupancy check: never place two runners on the same base. A trailing
-        # runner must stop behind the leading runner (rather than teleport home).
+        if not old[i]: continue
+        runner=runners[i]; speed=runner_speed(runner)
+        runner_name=(runner or {}).get('name','Runner') if isinstance(runner,dict) else 'Runner'
+        origin=['first','second','third'][i]
+        mandatory= (3 if i>=1 else 2) if distance==2 else i+1
+        optional_dest=None; dest=mandatory
+        if distance==2 and i==0:
+            chance=bounded(.31+.35*speed+(.16 if outs==2 else 0)-.018*(field_rating-5),.20,.83)
+            if random.random()<chance: optional_dest=3
+        elif distance==1 and i==1:
+            chance=bounded(.35+.45*speed+(.16 if outs==2 else 0)-.02*(field_rating-5),.25,.92)
+            if random.random()<chance: optional_dest=3
+        elif distance==1 and i==0:
+            chance=bounded(.08+.40*speed+(.11 if outs==2 else 0)-.018*(field_rating-5),.07,.60)
+            if random.random()<chance: optional_dest=2
+        # Optional extra-base tries may be cut down. Never send a trailing
+        # runner past another runner, and never score on an inning-ending out.
+        if optional_dest is not None and g['outs']<3:
+            blocked=optional_dest<3 and any(new[j] for j in range(optional_dest,3))
+            if not blocked:
+                g['extra_base_attempts']=g.get('extra_base_attempts',0)+1
+                base_name={2:'third',3:'home'}[optional_dest]
+                if random.random()<assist_probability(g,runner,thrower):
+                    g['outs']+=1;g['outfield_assists']=g.get('outfield_assists',0)+1
+                    g['basepath_outs']=g.get('basepath_outs',0)+1
+                    relay=('catcher' if optional_dest==3 else 'third baseman')
+                    notes.append(f'OUTFIELD ASSIST! {thrower.title()} throws to the {relay}; {runner_name} is tagged OUT trying for {base_name}!')
+                    if g['outs']>=3:
+                        notes.append('The throw ends the inning!')
+                        # A run that crossed earlier in this play is scored only
+                        # if not negated by a third-out force/batter-runner out.
+                    continue
+                dest=optional_dest
+                notes.append(f'{runner_name} takes the extra base and reaches {base_name} safely.')
+        # Existing runners must stay in correct order.
+        if dest<3:
+            while dest>=0 and new[dest]: dest-=1
+            if dest<=i: dest=i+1
         if dest>=3:
             runs+=1
+            notes.append(f'{runner_name} scores from {origin}.')
         else:
-            while dest>=0 and new[dest]:
-                dest-=1
-            if dest<0:
-                # This should not occur on the supported hit types.
-                dest=i+1
-            if dest>=3: runs+=1
-            else:
-                new[dest]=True;new_runners[dest]=runner
-    new[distance-1]=True
-    new_runners[distance-1]=hitter
-    g['bases']=new
-    g['base_runners']=new_runners
-    g['runs']+=runs
+            new[dest]=True;new_runners[dest]=runner
+    new[distance-1]=True;new_runners[distance-1]=hitter
+    g['bases']=new;g['base_runners']=new_runners;g['runs']+=runs
     g['runner_note']=' '.join(notes)
     return runs
 
@@ -646,37 +680,60 @@ def simulate(g,approach,defense):
     g['strategy_log'].append(dict(Inning=g['inning'],Batter=h['name'],Pitcher=p['name'],
       Approach=approach,Defense=defense,**{'Hit %':round(hp*100,1),'Walk %':round(wp*100,1)}))
     inning_before=g['inning'];outs_before=g['outs'];bases_before=g['bases'].copy()
-    roll=random.random();runs=0
-    if roll<wp:runs=walk_bases(g);result='walks'
+    roll=random.random();runs=0;action='';location='';fielder=''
+    if roll<wp:
+        runs=walk_bases(g);result='walks';action=f'{h["name"]} draws a walk.'
     elif roll<wp+hp:
         _,weights=batter_hit_rates(h);distance=random.choices([1,2,3,4],weights=weights,k=1)[0]
-        runs=advance_hit(g,distance,h);g['hits']+=1
+        location,fielder=ball_location(distance)
+        runs=advance_hit(g,distance,h,location,fielder);g['hits']+=1
         result={1:'singles',2:'DOUBLES',3:'TRIPLES',4:'HOMERS'}[distance]
-    elif roll<wp+hp+kp:g['outs']+=1;g['strikeouts']+=1;result='strikes out'
+        hit_type={1:'a single',2:'a double',3:'a triple',4:'a home run'}[distance]
+        action=f'{h["name"]} drives {hit_type} {location}. {fielder.title()} fields the ball.' if distance<4 else f'{h["name"]} launches a home run {location}!'
+    elif roll<wp+hp+kp:
+        g['outs']+=1;g['strikeouts']+=1;result='strikes out'
+        action=f'{p["name"]} strikes out {h["name"]}; catcher completes the putout.'
     else:
         if g['bases'][0] and g['outs']<2 and random.random()<(.27 if defense=='Double-play depth' else .11 if defense=='Infield in' else .16):
-            g['outs']+=2;g['double_plays']+=1;g['bases'][0]=False;g.setdefault('base_runners',[None,None,None])[0]=None;result='grounds into a DOUBLE PLAY'
+            location,fielder=ball_location(1,'ground')
+            g['outs']+=2;g['double_plays']+=1;g['bases'][0]=False
+            g.setdefault('base_runners',[None,None,None])[0]=None
+            result='grounds into a DOUBLE PLAY'
+            action=f'{h["name"]} grounds {location}. {fielder.title()} starts the double play; the defense gets the force at second and completes the throw to first.'
         elif g['bases'][2] and g['outs']<2 and random.random()<(.04 if defense=='Infield in' else .17):
-            g['outs']+=1;g['bases'][2]=False;g.setdefault('base_runners',[None,None,None])[2]=None;g['runs']+=1;runs=1;result='hits a sacrifice fly'
+            location,fielder=ball_location(1,'fly')
+            g['outs']+=1;g['bases'][2]=False;g.setdefault('base_runners',[None,None,None])[2]=None
+            g['runs']+=1;runs=1;result='hits a sacrifice fly'
+            action=f'{h["name"]} flies out {location}. {fielder.title()} makes the catch; the runner tags and scores.'
         else:
-            # Defensive errors are separate from credited hits.
+            kind=random.choices(['ground','fly','popup'],weights=[49,43,8])[0]
+            location,fielder=ball_location(1,kind)
             field_rating=number(g.get('team_defense',{}).get('rating'),5)
             error_chance=bounded(.018+(5-field_rating)*.004,.005,.045)
             if random.random()<error_chance:
-                runs=advance_hit(g,1,h)
+                runs=advance_hit(g,1,h,location,fielder)
                 g['errors']=g.get('errors',0)+1
                 result='reaches on a fielding ERROR'
+                action=f'{h["name"]} hits a ball {location}; {fielder} misplays it. Error charged to the {fielder}.'
             else:
                 g['outs']+=1
-                result='is retired on a ball in play' 
+                result='is retired on a ball in play'
+                if kind=='ground':
+                    action=f'{h["name"]} grounds {location}. {fielder.title()} fields it and throws to first baseman for the putout.'
+                else:
+                    action=f'{h["name"]} hits a {"pop-up" if kind=="popup" else "fly ball"} {location}. {fielder.title()} makes the catch for the putout.'
     pitches=random.randint(4,9) if approach=='Pitch carefully' else random.randint(2,6) if approach=='Attack the zone' else random.randint(3,8)
     g['pitches'][p['id']]+=pitches;g['faced'][p['id']]+=1;g['appearance']+=1
     update_confidence(g,p,result,runs)
     g['play_result']={'walks':'WALK','singles':'SINGLE','DOUBLES':'DOUBLE','TRIPLES':'TRIPLE','HOMERS':'HOME RUN!','strikes out':'STRIKEOUT','grounds into a DOUBLE PLAY':'DOUBLE PLAY','hits a sacrifice fly':'SAC FLY','is retired on a ball in play':'OUT','reaches on a fielding ERROR':'ERROR'}.get(result,'OUT')
-    g['play_detail']=f"{h['name']} vs. {p['name']}"+(f" · {g['runner_note']}" if g.get('runner_note') else '');g['play_runs']=runs
-    g['last_play']=f"Inning {g['inning']}: {h['name']} {result} vs. {p['name']} ({pitches} pitches)."+(f' {runs} run(s) score!' if runs else '')+((' '+g.get('runner_note','')) if g.get('runner_note') else '')
+    if 'OUTFIELD ASSIST!' in g.get('runner_note',''):
+        g['play_result']='OUTFIELD ASSIST!'
+    g['play_field']=action
+    g['play_detail']=action+(f' {g["runner_note"]}' if g.get('runner_note') else '')
+    g['play_runs']=runs
+    g['last_play']=f'Inning {g["inning"]}: {action} ({pitches} pitches).'+(f' {runs} run(s) score!' if runs else '')+((' '+g.get('runner_note','')) if g.get('runner_note') else '')
     g['log'].append(g['last_play'])
-    if g['play_result'] in ('HOME RUN!','TRIPLE','DOUBLE','STRIKEOUT','DOUBLE PLAY'):
+    if g['play_result'] in ('HOME RUN!','TRIPLE','DOUBLE','STRIKEOUT','DOUBLE PLAY','OUTFIELD ASSIST!'):
         g['highlights'].append(g['last_play'])
     after_batter(g)
     event_alert(g,result,runs,inning_before,outs_before,bases_before)
@@ -1064,7 +1121,7 @@ def safe_career_import(raw):
     return clean_manager_name(data.get('manager','Manager')),cleaned
 
 
-st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.2")
+st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.4")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
@@ -1298,6 +1355,7 @@ if g:
         else:
             st.caption('Select a reliever for a quick comparison.')
         st.caption('Modeled estimates; not MLB forecasts.')
+        st.caption(f"🎯 Outfield assists: {g.get('outfield_assists',0)} / {g.get('extra_base_attempts',0)} contested extra-base tries · 4% baseline per try")
     # Only optional, nonessential details below the main game.
     history_tab,scout_tab,lab_tab,report_tab=st.tabs(['📻 Play-by-play','🔍 Historical splits','📊 Full Matchup Lab','🏆 Manager Report'])
     with history_tab:
