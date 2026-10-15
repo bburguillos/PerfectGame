@@ -297,7 +297,8 @@ def starting_game(data, starter, mode):
       errors=0,dramatic_alert='',event_history=[],last_inning_ended=None,
       outfield_assists=0,extra_base_attempts=0,basepath_outs=0,play_field='',
       pitching_lines={q['id']:{'outs':0,'hits':0,'walks':0,'runs':0,'strikeouts':0,'batters':0} for q in staff},
-      final_event='',final_out_details='',batting_lines={},batting_order=[])
+      final_event='',final_out_details='',batting_lines={},batting_order=[],
+      iq_pending=None,iq_answers=[],iq_asked_innings=[],iq_enabled=data.get('iq_enabled',True))
 
 
 def pitcher(g): return next(p for p in g['staff'] if p['id']==g['pitcher'])
@@ -726,6 +727,9 @@ def after_batter(g):
     g['last_inning_ended']=None
     if g['outs']>=3:
         g['last_inning_ended']=g['inning']
+        if g['inning'] in (2,5,7) and g.get('iq_enabled',True) and g['inning'] not in g.get('iq_asked_innings',[]):
+            g['iq_pending']=g['inning']
+            g.setdefault('iq_asked_innings',[]).append(g['inning'])
         g['log'].append(f"End of inning {g['inning']} — {g['runs']} runs allowed.")
         if g.get('jam_escaped') and g['runs']==g['inning_start_runs'] and 'Escape Artist' not in g['achievements']:
             g['achievements'].append('Escape Artist')
@@ -1042,49 +1046,121 @@ def grade_letter(score):
     return 'A' if score >= 90 else 'B' if score >= 80 else 'C' if score >= 70 else 'D' if score >= 60 else 'F'
 
 
+def iq_review(g):
+    """Grade process of explaining a decision, independent of the simulated outcome."""
+    answers=g.get('iq_answers', [])
+    awarded=0
+    notes=[]
+    for a in answers:
+        current=float(a.get('current_risk',0))
+        alternative=float(a.get('relief_risk',0))
+        pick=a.get('choice')
+        evidence=a.get('evidence')
+        # Evidence is the larger part of the grade. A defensible alternative
+        # earns some points even if another option has lower modelled hit risk.
+        pts=0
+        if evidence=='compare':pts+=4
+        elif evidence=='fatigue':pts+=3
+        elif evidence=='matchup':pts+=3
+        elif evidence=='lastplay':pts+=0
+        if pick=='reliever':
+            pts+=3 if alternative+0.012<current else 1
+        elif pick=='stay':
+            pts+=3 if current<=alternative+0.012 else 1
+        else:
+            pts+=1 if a.get('runners',0)>0 else 0
+        # Require a real explanation to receive the final bonus.
+        if len(a.get('explanation','').strip())>=15:pts=min(7,pts+1)
+        awarded+=min(7,pts)
+        notes.append(f"Inning {a.get('inning','?')}: {min(7,pts)}/7 IQ points. Modelled current {current:.1f}% versus alternative {alternative:.1f}% hit risk. Evidence matters even if the play goes badly.")
+    # Scale 3 possible challenges to 20 points; unanswered challenges get 0.
+    if not g.get('iq_enabled',True):return 20,['Casual mode: IQ questions disabled, so this category receives full credit.']
+    return min(20,round(awarded*20/21)),notes
+
+
 def manager_assessment(g):
-    """Transparent classroom rubric: decisions matter more than simulated luck."""
-    changes = g.get('decisions', [])
-    actions = g.get('strategy_log', [])
-    total_pa = max(1, len(actions))
-    meaningful = sum(1 for a in actions if a.get('Approach') not in ('Balanced', None) or a.get('Defense') not in ('Normal', None, '—'))
-    # Strategy choices are evidence of active management, not automatically 'correct'.
-    engagement = min(20, round(16 * min(1, total_pa / 27) + 4 * min(1, meaningful / 6)))
-    # No bullpen change is not automatically a failure; baseline credit applies.
-    if changes:
-        good_matchups = sum(bool(x.get('Improved proxy')) for x in changes)
-        timely = sum(number(x.get('Fatigue at change')) <= 110 for x in changes)
-        bullpen = round(10 + 12 * good_matchups / len(changes) + 8 * timely / len(changes))
-    else:
-        bullpen = 24
-    bullpen = min(30, bullpen)
-    # Recognize reading the situation, without claiming to judge intent from a dropdown.
-    dangerous_actions = sum(1 for a in actions if a.get('Approach') in ('Pitch carefully', 'Attack the zone', 'Intentional walk') or a.get('Defense') in ('Infield in','Double-play depth'))
-    strategy = min(30, round(18 + 12 * min(1, dangerous_actions / 7)))
-    # Runs permitted carry only 20% of the final score.
-    outcome = max(0, 20 - min(20, int(g.get('runs',0)) * 3))
-    parts = {'Engagement': engagement, 'Bullpen decisions': bullpen,
-             'Situational strategy': strategy, 'Run prevention': outcome}
-    score = min(100, max(0, sum(parts.values())))
-    notes = []
-    if not changes:
-        notes.append('No pitching changes: the rubric awards baseline bullpen credit instead of assuming a mistake.')
-    elif any(x.get('Improved proxy') for x in changes):
-        notes.append('At least one pitching change improved the modelled matchup-risk index.')
-    else:
-        notes.append('Pitching changes did not lower the modelled matchup-risk index; discuss the reasons for those choices.')
-    if g.get('runs',0) == 0:
-        notes.append('Shutout achieved. Remember: a good decision can still lead to a hit, and luck matters.')
-    else:
-        notes.append('Runs allowed affect just 20% of the grade, so decisions matter more than random results.')
+    """Manager IQ: Grade available evidence and choices, not lucky outcomes."""
+    changes=g.get('decisions',[])
+    actions=g.get('strategy_log',[])
     scout=g.get('scouting',{})
-    if scout:
-        threats=set(scout.get('threat_ids',[]))
-        top_three={x['id'] for x in sorted(g['lineup'],key=lambda x:(number(x['stats'].get('ops')),number(x['stats'].get('homeRuns'))),reverse=True)[:3]}
-        overlap=len(threats & top_three)
-        notes.append(f"Pregame scouting: {overlap} of 3 selected threats matched the top three lineup hitters by the selected statistical ranking. This is feedback, not a guarantee of game outcomes.")
-        notes.append(f"Pregame plan: {scout.get('plan','Not recorded')}. Mound visits used: {5-g.get('mound_visits',5)}.")
+    threats=set(scout.get('threat_ids',[]))
+    top_three={x['id'] for x in sorted(g.get('lineup',[]),key=lambda x:(number(x.get('stats',{}).get('ops')),number(x.get('stats',{}).get('homeRuns'))),reverse=True)[:3]}
+    overlap=len(threats & top_three)
+    rationale=scout.get('rationale','').lower()
+    evidence_words=('era','whip','strike','split','left','right','innings','average','k/9','hits','obp','ops','walk')
+    scouting=min(20,6+3*overlap+(5 if any(x in rationale for x in evidence_words) else 1)) if scout else 0
+    # A starter pitching well is not punished for staying in. But late
+    # overuse counts as a decision-quality risk, not a punishment for hits.
+    if changes:
+        good=sum(bool(c.get('Improved proxy')) for c in changes)
+        timely=sum(number(c.get('Fatigue at change'))<=110 for c in changes)
+        bullpen=min(25,round(11+9*good/len(changes)+5*timely/len(changes)))
+    else:
+        bullpen=21
+    # Award a modest premium for strategy used at the appropriate base/out state.
+    strategic=sum(1 for a in actions if a.get('Approach') in ('Pitch carefully','Attack the zone','Intentional walk'))
+    defensive=sum(1 for a in actions if a.get('Defense') in ('Infield in','Double-play depth'))
+    visit_used=5-g.get('mound_visits',5)
+    situational=min(25,round(13+min(6,strategic*1.2)+min(4,defensive*1.2)+min(2,max(0,visit_used))))
+    iq,iq_notes=iq_review(g)
+    outcome=max(0,10-min(10,int(g.get('runs',0))*2))
+    parts={'Pregame scouting':scouting,'Bullpen decisions':bullpen,'Situational decisions':situational,'Manager IQ reasoning':iq,'Run prevention':outcome}
+    score=max(0,min(100,sum(parts.values())))
+    notes=[f'Pregame threat selections matched {overlap}/3 top OPS-ranked hitters (a teaching proxy).',
+           f'Manager IQ: {len(g.get("iq_answers",[]))}/3 challenges completed. Evidence earns points independently of the next play.',
+           'Only 10/100 points depend directly on runs allowed; the rubric uses instructional approximations.']+iq_notes
     return {'score':score,'letter':grade_letter(score),'parts':parts,'notes':notes}
+
+
+def manager_portrait(g):
+    """Grade reaction image stored beside app.py; optional session upload."""
+    score=manager_assessment(g)['score']
+    emotion='happy' if score>=85 else 'neutral' if score>=70 else 'sad'
+    title={'happy':'THE SKIPPER IS THRILLED!','neutral':'A SOLID DAY AT THE PARK','sad':'BACK TO THE DRAWING BOARD'}[emotion]
+    return emotion,title
+
+
+def render_manager_portrait(g):
+    import os
+    emotion,title=manager_portrait(g)
+    st.markdown('#### '+title)
+    filenames=[f'manager_{emotion}.png',f'manager_{emotion}.jpg',f'manager_{emotion}.jpeg',f'{emotion}.png',f'{emotion}.jpg']
+    found=next((name for name in filenames if os.path.isfile(name)),None)
+    uploaded=st.session_state.get(f'manager_avatar_{emotion}')
+    if uploaded:st.image(uploaded.getvalue(),width=270,caption=f"Manager reaction · {emotion.title()} · Grade {manager_assessment(g)['letter']}")
+    elif found:st.image(found,width=270,caption=f"Manager reaction · {emotion.title()} · Grade {manager_assessment(g)['letter']}")
+    else:
+        st.markdown({'happy':'# 😄','neutral':'# 😐','sad':'# 😞'}[emotion])
+        st.caption(f"For your exact reaction picture, upload an image called manager_{emotion}.png to the same GitHub folder as app.py.")
+
+
+def render_manager_iq(g):
+    """Call inside main game area before the Pitch to Batter control."""
+    if g.get('iq_pending') is None or g.get('finished'):return False
+    inning=g['iq_pending']
+    current=pitcher(g)
+    coming=batter(g)
+    current_hit=estimate(g,current,coming)[0]*100
+    candidates=[p for p in g['staff'] if p['id'] not in g.get('used',[])]
+    best=min(candidates,key=lambda p:estimate(g,p,coming)[0]) if candidates else None
+    alternative_hit=estimate(g,best,coming)[0]*100 if best else current_hit
+    st.warning(f'🧠 MANAGER IQ CHALLENGE · AFTER INNING {inning}')
+    st.write(f"Next hitter: **{coming['name']}**. Current pitcher: **{current['name']}**, modelled hit chance **{current_hit:.1f}%**, fatigue **{fatigue(g,current):.0%}**.")
+    if best:st.write(f"Potential relief option: **{best['name']}**, modelled hit chance **{alternative_hit:.1f}%** (if legally available and warmed).")
+    else:st.write('No unused reliever remains. Consider whether staying in is defensible.')
+    with st.form(key=f'iq_form_{len(g.get("iq_answers",[]))}_{inning}'):
+        choice=st.radio('What is the best managerial decision?', ['stay','reliever','walk'],format_func=lambda c:{'stay':'Leave the starter in','reliever':'Consider the available reliever','walk':'Intentionally walk the hitter'}[c])
+        evidence=st.radio('Which evidence matters most?', ['compare','fatigue','matchup','lastplay'],format_func=lambda x:{'compare':'Compare adjusted hit probabilities','fatigue':'Fatigue and workload','matchup':'Batter/pitcher handedness','lastplay':'Only the last at-bat result'}[x])
+        explanation=st.text_input('Explain your reasoning in one sentence',max_chars=200)
+        submitted=st.form_submit_button('SUBMIT MANAGER IQ ANSWER',type='primary',use_container_width=True)
+    if submitted:
+        g.setdefault('iq_answers',[]).append({'inning':inning,'choice':choice,'evidence':evidence,'explanation':explanation,
+          'current_risk':round(current_hit,1),'relief_risk':round(alternative_hit,1),
+          'runners':sum(bool(x) for x in g.get('bases',[]))})
+        g['iq_pending']=None
+        st.rerun()
+    st.caption('This evaluates statistical reasoning, not whether the next batter gets a hit. Finish the challenge to resume play.')
+    return True
 
 
 def career_record(g, name):
@@ -1104,6 +1180,7 @@ def career_record(g, name):
         'achievements':list(g.get('achievements',[])),
         'pitching_changes':len(g.get('decisions',[])),
         'strategies':len(g.get('strategy_log',[])),
+        'iq_challenges':len(g.get('iq_answers',[])),
         'scouting':g.get('scouting',{}),'mound_visits_used':5-g.get('mound_visits',5),
         'pitching_box':inning_pitching_summary(g),'key_decisions':key_manager_decisions(g)
     }
@@ -1150,8 +1227,8 @@ def make_game_pdf(g, name):
     story += [header,Spacer(1,12),Paragraph('How the grade was calculated',styles['SubtitleCustom'])]
     rubric=[['Category','Points earned','Maximum']]
     for k,v in assessment['parts'].items():
-        rubric.append([k,str(v),str({'Engagement':20,'Bullpen decisions':30,
-                                     'Situational strategy':30,'Run prevention':20}[k])])
+        rubric.append([k,str(v),str({'Pregame scouting':20,'Bullpen decisions':25,
+                                     'Situational decisions':25,'Manager IQ reasoning':20,'Run prevention':10}[k])])
     t=Table(rubric,colWidths=[280,115,115],hAlign='LEFT')
     t.setStyle(TableStyle([('BACKGROUND',(0,0),(-1,0),colors.HexColor('#E7EEF2')),
                            ('GRID',(0,0),(-1,-1),.35,colors.HexColor('#B3C5CC')),
@@ -1170,6 +1247,11 @@ def make_game_pdf(g, name):
         story.append(Paragraph('Selected threats: '+pdf_escape(selected),styles['SmallCustom']))
         story.append(Paragraph('Starter rationale: '+pdf_escape(scout.get('rationale','')),styles['SmallCustom']))
         story.append(Paragraph(f"Mound visits used: {5-g.get('mound_visits',5)}",styles['SmallCustom']))
+    story.append(Paragraph('Manager IQ challenges',styles['SubtitleCustom']))
+    if g.get('iq_answers'):
+        for idx,a in enumerate(g['iq_answers'],1):
+            story.append(Paragraph(f"Challenge {idx} · inning {a['inning']}: {pdf_escape(a['choice'])}; evidence: {pdf_escape(a['evidence'])}. {pdf_escape(a['explanation'])}",styles['SmallCustom']))
+    else:story.append(Paragraph('No Manager IQ answers recorded.',styles['SmallCustom']))
     story.append(Paragraph('Ballpark and defense',styles['SubtitleCustom']))
     story.append(Paragraph('Park: '+pdf_escape(g.get('park',{}).get('name','Unknown'))+' | Defensive rating: '+str(g.get('team_defense',{}).get('rating',5))+'/10 | Errors: '+str(g.get('errors',0)),styles['SmallCustom']))
     story.append(Paragraph('Pitching box score',styles['SubtitleCustom']))
@@ -1252,11 +1334,19 @@ def safe_career_import(raw):
     return clean_manager_name(data.get('manager','Manager')),cleaned
 
 
-st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.5")
+st.title("⚾ YOU'RE THE MANAGER · STADIUM EDITION 6B.7")
 st.caption('SPORTS BY THE NUMBERS  •  DOVER TIGERS  •  2000–2025 MLB  •  Historical player stats / simulated outcomes')
 if 'game' not in st.session_state: st.session_state.game=None
 if 'loaded' not in st.session_state: st.session_state.loaded=None
 if 'selected_relief_id' not in st.session_state: st.session_state.selected_relief_id=None
+with st.expander('🎭 Manager reaction pictures · Optional setup', expanded=False):
+    st.caption('For persistent pictures, add manager_sad.png, manager_neutral.png, manager_happy.png next to app.py on GitHub. Otherwise upload each picture below for this session.')
+    image_cols=st.columns(3)
+    for idx,mood in enumerate(('sad','neutral','happy')):
+        with image_cols[idx]:
+            uploaded=st.file_uploader(f'{mood.title()} picture',type=['png','jpg','jpeg'],key=f'manager_avatar_{mood}')
+            if uploaded:st.image(uploaded.getvalue(),width=110)
+
 if 'career_games' not in st.session_state: st.session_state.career_games=[]
 if 'career_name' not in st.session_state: st.session_state.career_name='Manager'
 
@@ -1357,9 +1447,11 @@ if loaded and st.session_state.game is None:
     plan=st.selectbox('Pregame strategy',[
        'Attack hitters early', 'Pitch carefully to power hitters',
        'Lean on ground-ball defense', 'Prepare the bullpen early'])
+    classroom_mode=st.checkbox('🧠 Classroom Mode · Three Manager IQ challenges',value=True,help='Challenges appear after innings 2, 5, and 7. Casual mode skips challenges.')
     rationale=st.text_input('Why did you choose this starter? (one statistical reason)',
        max_chars=180,placeholder='Example: Low WHIP and strong strikeout rate')
     if st.button('⚾ PLAY BALL!',type='primary',disabled=len(threats)!=3 or not rationale.strip()):
+        loaded['iq_enabled']=classroom_mode
         loaded['scouting']={'threat_ids':threats,'plan':plan,'rationale':rationale.strip(),
                            'starter_id':starter}
         st.session_state.game=starting_game(loaded,starter,difficulty)
@@ -1442,7 +1534,7 @@ if g:
         elif not available: st.caption('No unused pitchers remain')
     with center:
         st.markdown(f"**⚾ {escape(h['name'])}** · {escape(h['bats'])} BAT · AVG {h['stats'].get('avg','—')}")
-        if not g['finished']:
+        if not g['finished'] and not render_manager_iq(g):
             approach=st.radio('Pitch approach',['Balanced','Attack the zone','Pitch carefully'],horizontal=True,key='pitch_strategy',label_visibility='collapsed')
             defenses=['Normal']
             if g['bases'][0] and g['outs']<2:defenses.append('Double-play depth')
@@ -1502,6 +1594,7 @@ if g:
            <div style="font:700 12px Arial;letter-spacing:2px;color:#cbe9e6">{subhead}</div>
            <div style="font:700 15px Arial;margin:13px auto 3px;max-width:830px">{escape(g.get('final_out_details','Final out recorded.'))}</div>
            </div>""",unsafe_allow_html=True)
+        render_manager_portrait(g)
         final_a, final_b, final_c, final_d = st.columns(4)
         final_a.metric('RUNS ALLOWED',g['runs'])
         final_b.metric('HITS ALLOWED',g['hits'])
@@ -1584,7 +1677,7 @@ if g:
             if not key_manager_decisions(g):st.caption('No special substitutions or mound visits recorded.')
             st.caption('Pitching runs are assigned to the pitcher on the mound when scoring occurs; inherited-runner accounting is approximated.')
         st.metric('MANAGER GRADE',f"{assessment['letter']} · {assessment['score']}/100")
-        st.caption('Rubric: engagement 20, bullpen decisions 30, situational strategy 30, run prevention 20. Outcomes have only 20% weight.')
+        st.caption('Rubric: scouting 20, bullpen 25, situational decisions 25, Manager IQ reasoning 20, run prevention 10. Game results account for just 10%.')
         st.dataframe(pd.DataFrame([{'Category':k,'Points':v} for k,v in assessment['parts'].items()]),hide_index=True,use_container_width=True)
         for note in assessment['notes']:st.caption('• '+note)
         for achievement in g['achievements']:st.success('🏅 '+achievement)
